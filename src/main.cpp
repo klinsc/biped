@@ -4,33 +4,22 @@
 Adafruit_PWMServoDriver pwm(0x40);
 #define SERVO_FREQ 50
 
-// ====== CHANNEL MAP (ขาซ้าย: ล่าง -> บน) ======
-const uint8_t CH_ANKLE_ROLL  = 0; // Servo#1 แนวขวาง L/R
-const uint8_t CH_ANKLE_PITCH = 1; // Servo#2 หน้า/หลัง
-const uint8_t CH_KNEE_PITCH  = 2; // Servo#3 หน้า/หลัง
-const uint8_t CH_HIP_PITCH   = 3; // Servo#4 หน้า/หลัง
+// ====== แก้เลขช่องให้ตรงของคุณ ======
+const uint8_t R_ANKLE_ROLL  = 4; // ข้อเท้าขวา แนวขวาง L/R
+const uint8_t R_ANKLE_PITCH = 5; // ข้อเท้าขวา หน้า/หลัง
+const uint8_t R_KNEE_PITCH  = 6; // เข่าขวา หน้า/หลัง
+const uint8_t R_HIP_PITCH   = 7; // สะโพกขวา หน้า/หลัง
 
-// ====== ปรับทิศทางตามการติดตั้งจริง ======
-// ถ้าสั่ง + แล้วมันหมุนผิดทาง ให้สลับเป็น -1
-int DIR_ANKLE_ROLL  = +1;
-int DIR_ANKLE_PITCH = +1;
-int DIR_KNEE_PITCH  = -1;
-int DIR_HIP_PITCH   = +1;
+// ====== ทิศทาง (+1/-1) ======
+int DIR_R_ANKLE_ROLL  = -1;
+int DIR_R_ANKLE_PITCH = -1;
+int DIR_R_KNEE_PITCH  = +1;
+int DIR_R_HIP_PITCH   = -1;
 
-// ====== จำกัดช่วงปลอดภัย (กันชนสุด) ======
+// ====== microseconds ======
 const int US_CENTER = 1500;
-const int US_MIN    = 1000;   // ปรับได้ภายหลังตาม servo ของคุณ
-const int US_MAX    = 2000;
-
-// แปลง "องศาแบบคร่าวๆ" เป็น us (ตรงนี้ใช้เพื่อเทสง่าย)
-// 90deg ~ 1500us, ช่วง +-45deg ~ +-400us (ประมาณการ)
-int degToUs(int degFromCenter) {
-  // degFromCenter: -45..+45 แนะนำช่วงเทส
-  long us = US_CENTER + (long)degFromCenter * 8; // 1deg ~ 8us (ปรับได้)
-  if (us < US_MIN) us = US_MIN;
-  if (us > US_MAX) us = US_MAX;
-  return (int)us;
-}
+const int US_MIN = 1000;
+const int US_MAX = 2000;
 
 void writeServo(uint8_t ch, int us) {
   if (us < US_MIN) us = US_MIN;
@@ -38,26 +27,26 @@ void writeServo(uint8_t ch, int us) {
   pwm.writeMicroseconds(ch, us);
 }
 
-void setAllCenter() {
-  writeServo(CH_ANKLE_ROLL,  US_CENTER);
-  writeServo(CH_ANKLE_PITCH, US_CENTER);
-  writeServo(CH_KNEE_PITCH,  US_CENTER);
-  writeServo(CH_HIP_PITCH,   US_CENTER);
+void setRightCenter() {
+  writeServo(R_ANKLE_ROLL,  US_CENTER);
+  writeServo(R_ANKLE_PITCH, US_CENTER);
+  writeServo(R_KNEE_PITCH,  US_CENTER);
+  writeServo(R_HIP_PITCH,   US_CENTER);
 }
 
-// ขยับทีละข้อแบบนุ่ม
-void sweepOne(uint8_t ch, int dir, int fromDeg, int toDeg, int stepDeg=1, int dly=20) {
-  if (fromDeg < toDeg) {
-    for (int d = fromDeg; d <= toDeg; d += stepDeg) {
-      writeServo(ch, degToUs(dir * d));
-      delay(dly);
-    }
-  } else {
-    for (int d = fromDeg; d >= toDeg; d -= stepDeg) {
-      writeServo(ch, degToUs(dir * d));
-      delay(dly);
-    }
-  }
+// 1 deg ~ 8 us (ใช้เทสทิศทางพอ)
+int degToUs(int degFromCenter) {
+  long us = US_CENTER + (long)degFromCenter * 8;
+  if (us < US_MIN) us = US_MIN;
+  if (us > US_MAX) us = US_MAX;
+  return (int)us;
+}
+
+void bump(uint8_t ch, int dir, int deg = 10, int holdMs = 1200) {
+  writeServo(ch, degToUs(dir * deg));
+  delay(holdMs);
+  writeServo(ch, US_CENTER);
+  delay(800);
 }
 
 void setup() {
@@ -67,40 +56,29 @@ void setup() {
   pwm.setPWMFreq(SERVO_FREQ);
   delay(300);
 
-  // Phase: ตั้งท่ากลางเพื่อใส่ฮอร์น/เริ่มประกอบ
-  setAllCenter();
-  delay(1000);
+  setRightCenter();
+  delay(800);
 
-  Serial.println("Left leg 4DOF test: AnkleRoll, AnklePitch, KneePitch, HipPitch");
+  Serial.println("RIGHT LEG direction test (watch motion):");
+  Serial.println("1) Ankle Roll  (+deg)");
+  Serial.println("2) Ankle Pitch (+deg)");
+  Serial.println("3) Knee Pitch  (+deg)");
+  Serial.println("4) Hip Pitch   (+deg)");
 }
 
 void loop() {
-  // === ท่ายืนเริ่มต้น (ชั่วคราว) ===
-  // ตอนแรกให้ทุกตัวอยู่ center ก่อน
-  setAllCenter();
-  delay(800);
+  // 1) ข้อเท้าแนวขวาง: +deg ควรเอียง "ไปซ้ายของหุ่น" หรือ "ไปขวาของหุ่น" (คุณบอกผมที)
+  bump(R_ANKLE_ROLL, DIR_R_ANKLE_ROLL);
 
-  // 1) ทดสอบ Ankle Roll ซ้าย/ขวา เล็กๆ
-  sweepOne(CH_ANKLE_ROLL, DIR_ANKLE_ROLL, 0, +10, 1, 20);
-  sweepOne(CH_ANKLE_ROLL, DIR_ANKLE_ROLL, +10, -10, 1, 20);
-  sweepOne(CH_ANKLE_ROLL, DIR_ANKLE_ROLL, -10, 0, 1, 20);
-  delay(400);
+  // 2) ข้อเท้าหน้า/หลัง: +deg ควร "ปลายเท้าโน้มไปหน้า"
+  bump(R_ANKLE_PITCH, DIR_R_ANKLE_PITCH);
 
-  // 2) ทดสอบ Ankle Pitch ก้ม/เงย เล็กๆ
-  sweepOne(CH_ANKLE_PITCH, DIR_ANKLE_PITCH, 0, +10, 1, 20);
-  sweepOne(CH_ANKLE_PITCH, DIR_ANKLE_PITCH, +10, -10, 1, 20);
-  sweepOne(CH_ANKLE_PITCH, DIR_ANKLE_PITCH, -10, 0, 1, 20);
-  delay(400);
+  // 3) เข่า: +deg ควร "งอไปหน้า"
+  bump(R_KNEE_PITCH, DIR_R_KNEE_PITCH, 12);
 
-  // 3) ทดสอบ Knee Pitch งอเข่าเล็กน้อย (แนะนำทิศเดียวก่อน)
-  sweepOne(CH_KNEE_PITCH, DIR_KNEE_PITCH, 0, +15, 1, 25);
-  sweepOne(CH_KNEE_PITCH, DIR_KNEE_PITCH, +15, 0, 1, 25);
-  delay(400);
+  // 4) สะโพกหน้า/หลัง: +deg ควร "ขาทั้งข้างไปหน้า"
+  bump(R_HIP_PITCH, DIR_R_HIP_PITCH);
 
-  // 4) ทดสอบ Hip Pitch ขยับสะโพกหน้า/หลังเล็กๆ
-  sweepOne(CH_HIP_PITCH, DIR_HIP_PITCH, 0, +10, 1, 20);
-  sweepOne(CH_HIP_PITCH, DIR_HIP_PITCH, +10, -10, 1, 20);
-  sweepOne(CH_HIP_PITCH, DIR_HIP_PITCH, -10, 0, 1, 20);
-
-  delay(1200);
+  Serial.println("Cycle done. Repeat...");
+  delay(1500);
 }
