@@ -90,6 +90,8 @@ int* DIR_PTRS[DIR_COUNT] = {
   &DIR_R_HIP_ROLL
 };
 
+void bump(uint8_t ch, int dir, int deg = 10);
+
 int findDirIndex(const String& name) {
   for (int i = 0; i < DIR_COUNT; i++) {
     if (name == DIR_NAMES[i]) return i;
@@ -142,6 +144,14 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
   <div class="muted">แตะปุ่มเพื่อสลับค่าแบบ realtime</div>
   <div id="grid" class="grid" style="margin-top:12px"></div>
 
+  <h2 style="margin-top:18px">Manual Test</h2>
+  <div class="muted">กดเพื่อเพิ่ม/ลดมุมทีละข้อต่อ (ใช้ค่า DIR ปัจจุบัน)</div>
+  <div class="row" style="margin-top:8px">
+    <span class="muted">Step (deg)</span>
+    <input id="degStep" type="number" step="1" min="1" max="45" value="10" style="width:80px" />
+  </div>
+  <div id="testgrid" class="grid" style="margin-top:12px"></div>
+
   <h2 style="margin-top:18px">PID Tuning</h2>
   <div class="muted">ปรับได้จริงแบบ realtime (ค่าเริ่มต้นนุ่มๆ)</div>
   <div class="grid" style="margin-top:12px">
@@ -190,11 +200,27 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
       return div;
     }
 
+    function testCard(name){
+      const div = document.createElement('div');
+      div.className = 'card';
+      div.innerHTML = `
+        <div class="name">${name}</div>
+        <div class="row">
+          <button class="neg" onclick="testJoint('${name}',-1)">-</button>
+          <button class="pos" onclick="testJoint('${name}',+1)">+</button>
+        </div>
+      `;
+      return div;
+    }
+
     async function load(){
       const res = await fetch('/state');
       const data = await res.json();
       grid.innerHTML='';
       names.forEach(n => grid.appendChild(card(n, data[n])));
+      const testgrid = document.getElementById('testgrid');
+      testgrid.innerHTML='';
+      names.forEach(n => testgrid.appendChild(testCard(n)));
     }
 
     async function loadPid(){
@@ -215,6 +241,11 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
     async function setDir(name, val){
       await fetch(`/set?joint=${encodeURIComponent(name)}&dir=${val}`);
       document.getElementById(`val-${name}`).textContent = val;
+    }
+
+    async function testJoint(name, sign){
+      const deg = document.getElementById('degStep').value || 10;
+      await fetch(`/test?joint=${encodeURIComponent(name)}&deg=${encodeURIComponent(deg)}&sign=${sign}`);
     }
 
     load();
@@ -269,6 +300,49 @@ void setupWifiAndWeb() {
     server.send(200, "application/json", buildStateJson());
   });
 
+  server.on("/test", []() {
+    if (!server.hasArg("joint")) {
+      server.send(400, "text/plain", "missing joint");
+      return;
+    }
+    String joint = server.arg("joint");
+    int idx = findDirIndex(joint);
+    if (idx < 0) {
+      server.send(404, "text/plain", "joint not found");
+      return;
+    }
+    int dir = *DIR_PTRS[idx];
+    int sign = 1;
+    int deg = 10;
+    if (server.hasArg("sign")) {
+      sign = server.arg("sign").toInt();
+      if (sign != 1 && sign != -1) sign = 1;
+    }
+    if (server.hasArg("deg")) {
+      deg = server.arg("deg").toInt();
+      if (deg < 1) deg = 1;
+      if (deg > 45) deg = 45;
+    }
+    uint8_t ch = 255;
+    if (joint == "L_ANKLE_ROLL") ch = L_ANKLE_ROLL;
+    else if (joint == "L_ANKLE_PITCH") ch = L_ANKLE_PITCH;
+    else if (joint == "L_KNEE_PITCH") ch = L_KNEE_PITCH;
+    else if (joint == "L_HIP_PITCH") ch = L_HIP_PITCH;
+    else if (joint == "L_HIP_ROLL") ch = L_HIP_ROLL;
+    else if (joint == "R_ANKLE_ROLL") ch = R_ANKLE_ROLL;
+    else if (joint == "R_ANKLE_PITCH") ch = R_ANKLE_PITCH;
+    else if (joint == "R_KNEE_PITCH") ch = R_KNEE_PITCH;
+    else if (joint == "R_HIP_PITCH") ch = R_HIP_PITCH;
+    else if (joint == "R_HIP_ROLL") ch = R_HIP_ROLL;
+
+    if (ch == 255) {
+      server.send(404, "text/plain", "channel not found");
+      return;
+    }
+    bump(ch, dir * sign, deg);
+    server.send(200, "text/plain", "ok");
+  });
+
   server.on("/set_pid", []() {
     if (!server.hasArg("kp") || !server.hasArg("ki") || !server.hasArg("kd")) {
       server.send(400, "text/plain", "missing args");
@@ -299,7 +373,7 @@ void delayWithWeb(unsigned long ms) {
   }
 }
 
-void bump(uint8_t ch, int dir, int deg = 10) {
+void bump(uint8_t ch, int dir, int deg) {
   pwm.writeMicroseconds(ch, degToUs(dir * deg));
   delayWithWeb(1200);
   pwm.writeMicroseconds(ch, US_CENTER);
@@ -320,41 +394,5 @@ void setup() {
 
 void loop() {
   server.handleClient();
-
-  // ----- LEFT LEG -----
-  Serial.println("LEFT: Ankle Roll");
-  bump(L_ANKLE_ROLL, DIR_L_ANKLE_ROLL);
-
-  Serial.println("LEFT: Ankle Pitch");
-  bump(L_ANKLE_PITCH, DIR_L_ANKLE_PITCH);
-
-  Serial.println("LEFT: Knee Pitch");
-  bump(L_KNEE_PITCH, DIR_L_KNEE_PITCH);
-
-  Serial.println("LEFT: Hip Pitch");
-  bump(L_HIP_PITCH, DIR_L_HIP_PITCH);
-
-  Serial.println("LEFT: Hip Roll");
-  bump(L_HIP_ROLL, DIR_L_HIP_ROLL);
-
-  delayWithWeb(1500);
-
-  // ----- RIGHT LEG -----
-  Serial.println("RIGHT: Ankle Roll");
-  bump(R_ANKLE_ROLL, DIR_R_ANKLE_ROLL);
-
-  Serial.println("RIGHT: Ankle Pitch");
-  bump(R_ANKLE_PITCH, DIR_R_ANKLE_PITCH);
-
-  Serial.println("RIGHT: Knee Pitch");
-  bump(R_KNEE_PITCH, DIR_R_KNEE_PITCH);
-
-  Serial.println("RIGHT: Hip Pitch");
-  bump(R_HIP_PITCH, DIR_R_HIP_PITCH);
-
-  Serial.println("RIGHT: Hip Roll");
-  bump(R_HIP_ROLL, DIR_R_HIP_ROLL);
-
-  Serial.println("=== Cycle complete ===");
-  delayWithWeb(3000);
+  delay(5);
 }
