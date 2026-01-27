@@ -11,6 +11,11 @@ const char* WIFI_SSID = "Boomx_2.4G";
 const char* WIFI_PASS = "11111111";
 WebServer server(80);
 
+// ===== PID (soft defaults) =====
+volatile float PID_KP = 0.6f;
+volatile float PID_KI = 0.02f;
+volatile float PID_KD = 0.08f;
+
 // ===== LEFT LEG =====
 #define L_ANKLE_ROLL   0
 #define L_ANKLE_PITCH  1
@@ -102,6 +107,15 @@ String buildStateJson() {
   return json;
 }
 
+String buildPidJson() {
+  String json = "{";
+  json += "\"kp\":" + String(PID_KP, 3) + ",";
+  json += "\"ki\":" + String(PID_KI, 3) + ",";
+  json += "\"kd\":" + String(PID_KD, 3);
+  json += "}";
+  return json;
+}
+
 const char INDEX_HTML[] PROGMEM = R"HTML(
 <!DOCTYPE html>
 <html>
@@ -127,6 +141,32 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
   <h2>DIR (+1 / -1) Tuning</h2>
   <div class="muted">แตะปุ่มเพื่อสลับค่าแบบ realtime</div>
   <div id="grid" class="grid" style="margin-top:12px"></div>
+
+  <h2 style="margin-top:18px">PID Tuning</h2>
+  <div class="muted">ปรับได้จริงแบบ realtime (ค่าเริ่มต้นนุ่มๆ)</div>
+  <div class="grid" style="margin-top:12px">
+    <div class="card">
+      <div class="name">Kp</div>
+      <div class="row">
+        <input id="kp" type="number" step="0.01" style="width:100%" />
+        <button class="pos" onclick="savePid()">Set</button>
+      </div>
+    </div>
+    <div class="card">
+      <div class="name">Ki</div>
+      <div class="row">
+        <input id="ki" type="number" step="0.01" style="width:100%" />
+        <button class="pos" onclick="savePid()">Set</button>
+      </div>
+    </div>
+    <div class="card">
+      <div class="name">Kd</div>
+      <div class="row">
+        <input id="kd" type="number" step="0.01" style="width:100%" />
+        <button class="pos" onclick="savePid()">Set</button>
+      </div>
+    </div>
+  </div>
 
   <script>
     const names = [
@@ -157,12 +197,28 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
       names.forEach(n => grid.appendChild(card(n, data[n])));
     }
 
+    async function loadPid(){
+      const res = await fetch('/pid');
+      const pid = await res.json();
+      document.getElementById('kp').value = pid.kp;
+      document.getElementById('ki').value = pid.ki;
+      document.getElementById('kd').value = pid.kd;
+    }
+
+    async function savePid(){
+      const kp = document.getElementById('kp').value;
+      const ki = document.getElementById('ki').value;
+      const kd = document.getElementById('kd').value;
+      await fetch(`/set_pid?kp=${encodeURIComponent(kp)}&ki=${encodeURIComponent(ki)}&kd=${encodeURIComponent(kd)}`);
+    }
+
     async function setDir(name, val){
       await fetch(`/set?joint=${encodeURIComponent(name)}&dir=${val}`);
       document.getElementById(`val-${name}`).textContent = val;
     }
 
     load();
+    loadPid();
     setInterval(load, 2000);
   </script>
 </body>
@@ -189,6 +245,10 @@ void setupWifiAndWeb() {
     server.send(200, "application/json", buildStateJson());
   });
 
+  server.on("/pid", []() {
+    server.send(200, "application/json", buildPidJson());
+  });
+
   server.on("/set", []() {
     if (!server.hasArg("joint") || !server.hasArg("dir")) {
       server.send(400, "text/plain", "missing args");
@@ -207,6 +267,17 @@ void setupWifiAndWeb() {
     }
     *DIR_PTRS[idx] = dir;
     server.send(200, "application/json", buildStateJson());
+  });
+
+  server.on("/set_pid", []() {
+    if (!server.hasArg("kp") || !server.hasArg("ki") || !server.hasArg("kd")) {
+      server.send(400, "text/plain", "missing args");
+      return;
+    }
+    PID_KP = server.arg("kp").toFloat();
+    PID_KI = server.arg("ki").toFloat();
+    PID_KD = server.arg("kd").toFloat();
+    server.send(200, "application/json", buildPidJson());
   });
 
   server.begin();
