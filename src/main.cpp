@@ -1,8 +1,15 @@
 #include <Wire.h>
 #include <Adafruit_PWMServoDriver.h>
+#include <WiFi.h>
+#include <WebServer.h>
 
 Adafruit_PWMServoDriver pwm(0x40);
 #define SERVO_FREQ 50
+
+// ===== WiFi =====
+const char* WIFI_SSID = "Boomx_2.4G";
+const char* WIFI_PASS = "11111111";
+WebServer server(80);
 
 // ===== LEFT LEG =====
 #define L_ANKLE_ROLL   0
@@ -37,6 +44,174 @@ int DIR_R_KNEE_PITCH  = +1;
 int DIR_R_HIP_PITCH   = +1;
 int DIR_R_HIP_ROLL    = +1;
 
+// ===== DIR registry =====
+enum DirIndex {
+  DIR_L_ANKLE_ROLL_IDX,
+  DIR_L_ANKLE_PITCH_IDX,
+  DIR_L_KNEE_PITCH_IDX,
+  DIR_L_HIP_PITCH_IDX,
+  DIR_L_HIP_ROLL_IDX,
+  DIR_R_ANKLE_ROLL_IDX,
+  DIR_R_ANKLE_PITCH_IDX,
+  DIR_R_KNEE_PITCH_IDX,
+  DIR_R_HIP_PITCH_IDX,
+  DIR_R_HIP_ROLL_IDX,
+  DIR_COUNT
+};
+
+const char* DIR_NAMES[DIR_COUNT] = {
+  "L_ANKLE_ROLL",
+  "L_ANKLE_PITCH",
+  "L_KNEE_PITCH",
+  "L_HIP_PITCH",
+  "L_HIP_ROLL",
+  "R_ANKLE_ROLL",
+  "R_ANKLE_PITCH",
+  "R_KNEE_PITCH",
+  "R_HIP_PITCH",
+  "R_HIP_ROLL"
+};
+
+int* DIR_PTRS[DIR_COUNT] = {
+  &DIR_L_ANKLE_ROLL,
+  &DIR_L_ANKLE_PITCH,
+  &DIR_L_KNEE_PITCH,
+  &DIR_L_HIP_PITCH,
+  &DIR_L_HIP_ROLL,
+  &DIR_R_ANKLE_ROLL,
+  &DIR_R_ANKLE_PITCH,
+  &DIR_R_KNEE_PITCH,
+  &DIR_R_HIP_PITCH,
+  &DIR_R_HIP_ROLL
+};
+
+int findDirIndex(const String& name) {
+  for (int i = 0; i < DIR_COUNT; i++) {
+    if (name == DIR_NAMES[i]) return i;
+  }
+  return -1;
+}
+
+String buildStateJson() {
+  String json = "{";
+  for (int i = 0; i < DIR_COUNT; i++) {
+    json += "\"" + String(DIR_NAMES[i]) + "\":" + String(*DIR_PTRS[i]);
+    if (i < DIR_COUNT - 1) json += ",";
+  }
+  json += "}";
+  return json;
+}
+
+const char INDEX_HTML[] PROGMEM = R"HTML(
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>DIR Tuning</title>
+  <style>
+    body{font-family:Arial,Helvetica,sans-serif;margin:20px;background:#0b0f14;color:#e6edf3}
+    h2{margin-bottom:8px}
+    .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px}
+    .card{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:12px}
+    .name{font-weight:bold;margin-bottom:8px}
+    .row{display:flex;align-items:center;gap:10px}
+    button{border:0;border-radius:6px;padding:8px 12px;cursor:pointer}
+    .neg{background:#da3633;color:#fff}
+    .pos{background:#238636;color:#fff}
+    .val{min-width:24px;text-align:center;font-weight:bold}
+    .muted{opacity:.7;font-size:12px}
+  </style>
+</head>
+<body>
+  <h2>DIR (+1 / -1) Tuning</h2>
+  <div class="muted">แตะปุ่มเพื่อสลับค่าแบบ realtime</div>
+  <div id="grid" class="grid" style="margin-top:12px"></div>
+
+  <script>
+    const names = [
+      "L_ANKLE_ROLL","L_ANKLE_PITCH","L_KNEE_PITCH","L_HIP_PITCH","L_HIP_ROLL",
+      "R_ANKLE_ROLL","R_ANKLE_PITCH","R_KNEE_PITCH","R_HIP_PITCH","R_HIP_ROLL"
+    ];
+
+    const grid = document.getElementById('grid');
+
+    function card(name, val){
+      const div = document.createElement('div');
+      div.className = 'card';
+      div.innerHTML = `
+        <div class="name">${name}</div>
+        <div class="row">
+          <button class="neg" onclick="setDir('${name}',-1)">-1</button>
+          <div class="val" id="val-${name}">${val}</div>
+          <button class="pos" onclick="setDir('${name}',+1)">+1</button>
+        </div>
+      `;
+      return div;
+    }
+
+    async function load(){
+      const res = await fetch('/state');
+      const data = await res.json();
+      grid.innerHTML='';
+      names.forEach(n => grid.appendChild(card(n, data[n])));
+    }
+
+    async function setDir(name, val){
+      await fetch(`/set?joint=${encodeURIComponent(name)}&dir=${val}`);
+      document.getElementById(`val-${name}`).textContent = val;
+    }
+
+    load();
+    setInterval(load, 2000);
+  </script>
+</body>
+</html>
+)HTML";
+
+void setupWifiAndWeb() {
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  Serial.print("WiFi connecting");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println();
+  Serial.print("IP: ");
+  Serial.println(WiFi.localIP());
+
+  server.on("/", []() {
+    server.send_P(200, "text/html", INDEX_HTML);
+  });
+
+  server.on("/state", []() {
+    server.send(200, "application/json", buildStateJson());
+  });
+
+  server.on("/set", []() {
+    if (!server.hasArg("joint") || !server.hasArg("dir")) {
+      server.send(400, "text/plain", "missing args");
+      return;
+    }
+    String joint = server.arg("joint");
+    int dir = server.arg("dir").toInt();
+    if (dir != 1 && dir != -1) {
+      server.send(400, "text/plain", "dir must be 1 or -1");
+      return;
+    }
+    int idx = findDirIndex(joint);
+    if (idx < 0) {
+      server.send(404, "text/plain", "joint not found");
+      return;
+    }
+    *DIR_PTRS[idx] = dir;
+    server.send(200, "application/json", buildStateJson());
+  });
+
+  server.begin();
+}
+
 // ===== helper =====
 int degToUs(int deg) {
   long us = US_CENTER + (long)deg * 8; // ~8us/deg
@@ -45,11 +220,19 @@ int degToUs(int deg) {
   return us;
 }
 
+void delayWithWeb(unsigned long ms) {
+  unsigned long start = millis();
+  while (millis() - start < ms) {
+    server.handleClient();
+    delay(5);
+  }
+}
+
 void bump(uint8_t ch, int dir, int deg = 10) {
   pwm.writeMicroseconds(ch, degToUs(dir * deg));
-  delay(1200);
+  delayWithWeb(1200);
   pwm.writeMicroseconds(ch, US_CENTER);
-  delay(800);
+  delayWithWeb(800);
 }
 
 void setup() {
@@ -59,10 +242,14 @@ void setup() {
   pwm.setPWMFreq(SERVO_FREQ);
   delay(300);
 
+  setupWifiAndWeb();
+
   Serial.println("=== Direction Check : Legs + HIP_ROLL ===");
 }
 
 void loop() {
+  server.handleClient();
+
   // ----- LEFT LEG -----
   Serial.println("LEFT: Ankle Roll");
   bump(L_ANKLE_ROLL, DIR_L_ANKLE_ROLL);
@@ -79,7 +266,7 @@ void loop() {
   Serial.println("LEFT: Hip Roll");
   bump(L_HIP_ROLL, DIR_L_HIP_ROLL);
 
-  delay(1500);
+  delayWithWeb(1500);
 
   // ----- RIGHT LEG -----
   Serial.println("RIGHT: Ankle Roll");
@@ -98,5 +285,5 @@ void loop() {
   bump(R_HIP_ROLL, DIR_R_HIP_ROLL);
 
   Serial.println("=== Cycle complete ===");
-  delay(3000);
+  delayWithWeb(3000);
 }
