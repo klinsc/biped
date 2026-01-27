@@ -11,6 +11,9 @@ const char* WIFI_SSID = "Boomx_2.4G";
 const char* WIFI_PASS = "11111111";
 WebServer server(80);
 
+// ===== Safety =====
+volatile bool ESTOP_ACTIVE = false;
+
 // ===== PID (soft defaults) =====
 volatile float PID_KP = 0.6f;
 volatile float PID_KI = 0.02f;
@@ -91,6 +94,7 @@ int* DIR_PTRS[DIR_COUNT] = {
 };
 
 void bump(uint8_t ch, int dir, int deg = 10);
+void applyEmergencyStop(bool active);
 
 int findDirIndex(const String& name) {
   for (int i = 0; i < DIR_COUNT; i++) {
@@ -114,6 +118,13 @@ String buildPidJson() {
   json += "\"kp\":" + String(PID_KP, 3) + ",";
   json += "\"ki\":" + String(PID_KI, 3) + ",";
   json += "\"kd\":" + String(PID_KD, 3);
+  json += "}";
+  return json;
+}
+
+String buildSafetyJson() {
+  String json = "{";
+  json += "\"estop\":" + String(ESTOP_ACTIVE ? 1 : 0);
   json += "}";
   return json;
 }
@@ -149,6 +160,11 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
   <div class="row" style="margin-top:8px">
     <span class="muted">Step (deg)</span>
     <input id="degStep" type="number" step="1" min="1" max="45" value="10" style="width:80px" />
+  </div>
+  <div class="row" style="margin-top:8px">
+    <button class="neg" onclick="setEStop(true)">EMERGENCY STOP</button>
+    <button class="pos" onclick="setEStop(false)">RESET</button>
+    <span id="estopState" class="muted"></span>
   </div>
   <div id="testgrid" class="grid" style="margin-top:12px"></div>
 
@@ -231,6 +247,12 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
       document.getElementById('kd').value = pid.kd;
     }
 
+    async function loadSafety(){
+      const res = await fetch('/safety');
+      const s = await res.json();
+      document.getElementById('estopState').textContent = s.estop ? 'ESTOP: ON' : 'ESTOP: OFF';
+    }
+
     async function savePid(){
       const kp = document.getElementById('kp').value;
       const ki = document.getElementById('ki').value;
@@ -248,9 +270,16 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
       await fetch(`/test?joint=${encodeURIComponent(name)}&deg=${encodeURIComponent(deg)}&sign=${sign}`);
     }
 
+    async function setEStop(on){
+      await fetch(`/estop?on=${on ? 1 : 0}`);
+      loadSafety();
+    }
+
     load();
     loadPid();
+    loadSafety();
     setInterval(load, 2000);
+    setInterval(loadSafety, 2000);
   </script>
 </body>
 </html>
@@ -280,6 +309,10 @@ void setupWifiAndWeb() {
     server.send(200, "application/json", buildPidJson());
   });
 
+  server.on("/safety", []() {
+    server.send(200, "application/json", buildSafetyJson());
+  });
+
   server.on("/set", []() {
     if (!server.hasArg("joint") || !server.hasArg("dir")) {
       server.send(400, "text/plain", "missing args");
@@ -301,6 +334,10 @@ void setupWifiAndWeb() {
   });
 
   server.on("/test", []() {
+    if (ESTOP_ACTIVE) {
+      server.send(423, "text/plain", "estop active");
+      return;
+    }
     if (!server.hasArg("joint")) {
       server.send(400, "text/plain", "missing joint");
       return;
@@ -343,6 +380,16 @@ void setupWifiAndWeb() {
     server.send(200, "text/plain", "ok");
   });
 
+  server.on("/estop", []() {
+    if (!server.hasArg("on")) {
+      server.send(400, "text/plain", "missing on");
+      return;
+    }
+    bool on = server.arg("on").toInt() == 1;
+    applyEmergencyStop(on);
+    server.send(200, "application/json", buildSafetyJson());
+  });
+
   server.on("/set_pid", []() {
     if (!server.hasArg("kp") || !server.hasArg("ki") || !server.hasArg("kd")) {
       server.send(400, "text/plain", "missing args");
@@ -373,7 +420,24 @@ void delayWithWeb(unsigned long ms) {
   }
 }
 
+void applyEmergencyStop(bool active) {
+  ESTOP_ACTIVE = active;
+  if (active) {
+    pwm.writeMicroseconds(L_ANKLE_ROLL, US_CENTER);
+    pwm.writeMicroseconds(L_ANKLE_PITCH, US_CENTER);
+    pwm.writeMicroseconds(L_KNEE_PITCH, US_CENTER);
+    pwm.writeMicroseconds(L_HIP_PITCH, US_CENTER);
+    pwm.writeMicroseconds(L_HIP_ROLL, US_CENTER);
+    pwm.writeMicroseconds(R_ANKLE_ROLL, US_CENTER);
+    pwm.writeMicroseconds(R_ANKLE_PITCH, US_CENTER);
+    pwm.writeMicroseconds(R_KNEE_PITCH, US_CENTER);
+    pwm.writeMicroseconds(R_HIP_PITCH, US_CENTER);
+    pwm.writeMicroseconds(R_HIP_ROLL, US_CENTER);
+  }
+}
+
 void bump(uint8_t ch, int dir, int deg) {
+  if (ESTOP_ACTIVE) return;
   pwm.writeMicroseconds(ch, degToUs(dir * deg));
   delayWithWeb(1200);
   pwm.writeMicroseconds(ch, US_CENTER);
