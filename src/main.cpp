@@ -3,6 +3,7 @@
 #include <WiFi.h>
 #include <AsyncTCP.h>
 #include <ESPAsyncWebServer.h>
+#include <Update.h>
 
 Adafruit_PWMServoDriver pwm(0x40);
 #define SERVO_FREQ 50
@@ -14,6 +15,9 @@ AsyncWebServer server(80);
 
 // ===== Safety =====
 volatile bool ESTOP_ACTIVE = false;
+const int MAX_DEG_PER_CMD = 25;           // limit per command
+const unsigned long MIN_CMD_INTERVAL_MS = 250; // rate limit
+unsigned long lastCmdMs = 0;
 
 // ===== PID (soft defaults) =====
 volatile float PID_KP = 0.6f;
@@ -286,6 +290,33 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
 </html>
 )HTML";
 
+const char UPDATE_HTML[] PROGMEM = R"HTML(
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>OTA Update</title>
+  <style>
+    body{font-family:Arial,Helvetica,sans-serif;margin:20px;background:#0b0f14;color:#e6edf3}
+    .card{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:16px;max-width:480px}
+    input[type=file]{width:100%;margin:8px 0}
+    button{border:0;border-radius:6px;padding:8px 12px;cursor:pointer;background:#238636;color:#fff}
+  </style>
+</head>
+<body>
+  <h2>OTA Update</h2>
+  <div class="card">
+    <form method="POST" action="/update" enctype="multipart/form-data">
+      <input type="file" name="update" accept=".bin" required />
+      <button type="submit">Upload</button>
+    </form>
+    <div style="margin-top:8px" class="muted">อย่าปิดไฟระหว่างอัปโหลด</div>
+  </div>
+</body>
+</html>
+)HTML";
+
 void setupWifiAndWeb() {
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASS);
@@ -339,6 +370,11 @@ void setupWifiAndWeb() {
       request->send(423, "text/plain", "estop active");
       return;
     }
+    unsigned long now = millis();
+    if (now - lastCmdMs < MIN_CMD_INTERVAL_MS) {
+      request->send(429, "text/plain", "rate limited");
+      return;
+    }
     if (!request->hasParam("joint")) {
       request->send(400, "text/plain", "missing joint");
       return;
@@ -359,7 +395,7 @@ void setupWifiAndWeb() {
     if (request->hasParam("deg")) {
       deg = request->getParam("deg")->value().toInt();
       if (deg < 1) deg = 1;
-      if (deg > 45) deg = 45;
+      if (deg > MAX_DEG_PER_CMD) deg = MAX_DEG_PER_CMD;
     }
     uint8_t ch = 255;
     if (joint == "L_ANKLE_ROLL") ch = L_ANKLE_ROLL;
@@ -377,6 +413,7 @@ void setupWifiAndWeb() {
       request->send(404, "text/plain", "channel not found");
       return;
     }
+    lastCmdMs = now;
     bump(ch, dir * sign, deg);
     request->send(200, "text/plain", "ok");
   });
@@ -401,6 +438,40 @@ void setupWifiAndWeb() {
     PID_KD = request->getParam("kd")->value().toFloat();
     request->send(200, "application/json", buildPidJson());
   });
+
+  server.on("/update", HTTP_GET, [](AsyncWebServerRequest *request) {
+    request->send(200, "text/html", UPDATE_HTML);
+  });
+
+  server.on(
+    "/update",
+    HTTP_POST,
+    [](AsyncWebServerRequest *request) {
+      bool ok = !Update.hasError();
+      request->send(ok ? 200 : 500, "text/plain", ok ? "OK" : "FAIL");
+      if (ok) {
+        delay(100);
+        ESP.restart();
+      }
+    },
+    [](AsyncWebServerRequest *request, String filename, size_t index, uint8_t *data, size_t len, bool final) {
+      if (!index) {
+        if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
+          Update.printError(Serial);
+        }
+      }
+      if (!Update.hasError()) {
+        if (Update.write(data, len) != len) {
+          Update.printError(Serial);
+        }
+      }
+      if (final) {
+        if (!Update.end(true)) {
+          Update.printError(Serial);
+        }
+      }
+    }
+  );
 
   server.begin();
 }
