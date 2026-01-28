@@ -12,6 +12,11 @@ Adafruit_PWMServoDriver pwm(0x40);
 const char* WIFI_SSID = "Boomx_2.4G";
 const char* WIFI_PASS = "11111111";
 AsyncWebServer server(80);
+const IPAddress STATIC_IP(192, 168, 1, 163);
+const IPAddress GATEWAY(192, 168, 1, 1);
+const IPAddress SUBNET(255, 255, 255, 0);
+const IPAddress DNS1(192, 168, 1, 1);
+const IPAddress DNS2(8, 8, 8, 8);
 
 // ===== Safety =====
 volatile bool ESTOP_ACTIVE = false;
@@ -319,6 +324,7 @@ const char UPDATE_HTML[] PROGMEM = R"HTML(
 
 void setupWifiAndWeb() {
   WiFi.mode(WIFI_STA);
+  WiFi.config(STATIC_IP, GATEWAY, SUBNET, DNS1, DNS2);
   WiFi.begin(WIFI_SSID, WIFI_PASS);
   Serial.print("WiFi connecting");
   while (WiFi.status() != WL_CONNECTED) {
