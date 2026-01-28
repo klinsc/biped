@@ -11,7 +11,7 @@ Adafruit_PWMServoDriver pwm(0x40);
 const char* WIFI_SSID = "Boomx_2.4G";
 const char* WIFI_PASS = "11111111";
 AsyncWebServer server(80);
-AsyncEventSource events("/events");
+AsyncWebSocket ws("/ws");
 
 // ===== Safety =====
 volatile bool ESTOP_ACTIVE = false;
@@ -298,19 +298,13 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
     loadPid();
     loadSafety();
 
-    const es = new EventSource('/events');
-    es.addEventListener('state', (e) => {
-      const data = JSON.parse(e.data);
-      renderState(data);
-    });
-    es.addEventListener('pid', (e) => {
-      const data = JSON.parse(e.data);
-      renderPid(data);
-    });
-    es.addEventListener('safety', (e) => {
-      const data = JSON.parse(e.data);
-      renderSafety(data);
-    });
+    const ws = new WebSocket(`ws://${location.host}/ws`);
+    ws.onmessage = (event) => {
+      const msg = JSON.parse(event.data);
+      if (msg.type === 'state') renderState(msg.data);
+      else if (msg.type === 'pid') renderPid(msg.data);
+      else if (msg.type === 'safety') renderSafety(msg.data);
+    };
   </script>
 </body>
 </html>
@@ -361,7 +355,8 @@ void setupWifiAndWeb() {
       return;
     }
     *DIR_PTRS[idx] = dir;
-    events.send(buildStateJson().c_str(), "state");
+    String payload = String("{\"type\":\"state\",\"data\":") + buildStateJson() + "}";
+    ws.textAll(payload);
     request->send(200, "application/json", buildStateJson());
   });
 
@@ -419,7 +414,8 @@ void setupWifiAndWeb() {
     }
     bool on = request->getParam("on")->value().toInt() == 1;
     applyEmergencyStop(on);
-    events.send(buildSafetyJson().c_str(), "safety");
+    String payload = String("{\"type\":\"safety\",\"data\":") + buildSafetyJson() + "}";
+    ws.textAll(payload);
     request->send(200, "application/json", buildSafetyJson());
   });
 
@@ -431,20 +427,24 @@ void setupWifiAndWeb() {
     PID_KP = request->getParam("kp")->value().toFloat();
     PID_KI = request->getParam("ki")->value().toFloat();
     PID_KD = request->getParam("kd")->value().toFloat();
-    events.send(buildPidJson().c_str(), "pid");
+    String payload = String("{\"type\":\"pid\",\"data\":") + buildPidJson() + "}";
+    ws.textAll(payload);
     request->send(200, "application/json", buildPidJson());
   });
 
-  events.onConnect([](AsyncEventSourceClient *client) {
-    if (client->lastId()) {
-      Serial.printf("SSE client reconnected, lastId: %u\n", client->lastId());
+  ws.onEvent([](AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventType type,
+                void *arg, uint8_t *data, size_t len) {
+    if (type == WS_EVT_CONNECT) {
+      String statePayload = String("{\"type\":\"state\",\"data\":") + buildStateJson() + "}";
+      String pidPayload = String("{\"type\":\"pid\",\"data\":") + buildPidJson() + "}";
+      String safetyPayload = String("{\"type\":\"safety\",\"data\":") + buildSafetyJson() + "}";
+      client->text(statePayload);
+      client->text(pidPayload);
+      client->text(safetyPayload);
     }
-    client->send(buildStateJson().c_str(), "state");
-    client->send(buildPidJson().c_str(), "pid");
-    client->send(buildSafetyJson().c_str(), "safety");
   });
 
-  server.addHandler(&events);
+  server.addHandler(&ws);
 
   server.begin();
 }
@@ -475,7 +475,8 @@ void applyEmergencyStop(bool active) {
     pwm.writeMicroseconds(R_HIP_PITCH, US_CENTER);
     pwm.writeMicroseconds(R_HIP_ROLL, US_CENTER);
   }
-  events.send(buildSafetyJson().c_str(), "safety");
+  String payload = String("{\"type\":\"safety\",\"data\":") + buildSafetyJson() + "}";
+  ws.textAll(payload);
 }
 
 void bump(uint8_t ch, int dir, int deg) {
@@ -503,8 +504,11 @@ void loop() {
   unsigned long now = millis();
   if (now - lastPush >= 1000) {
     lastPush = now;
-    events.send(buildStateJson().c_str(), "state");
-    events.send(buildSafetyJson().c_str(), "safety");
+    String statePayload = String("{\"type\":\"state\",\"data\":") + buildStateJson() + "}";
+    String safetyPayload = String("{\"type\":\"safety\",\"data\":") + buildSafetyJson() + "}";
+    ws.textAll(statePayload);
+    ws.textAll(safetyPayload);
   }
+  ws.cleanupClients();
   delay(5);
 }
