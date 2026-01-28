@@ -43,15 +43,15 @@ const int US_MAX = 2000;
 // ถ้าข้อไหนผิด → เปลี่ยนเครื่องหมายตัวนั้นตัวเดียว
 int DIR_L_ANKLE_ROLL  = +1;
 int DIR_L_ANKLE_PITCH = +1;
-int DIR_L_KNEE_PITCH  = +1;
+int DIR_L_KNEE_PITCH  = -1;
 int DIR_L_HIP_PITCH   = +1;
 int DIR_L_HIP_ROLL    = +1;
 
-int DIR_R_ANKLE_ROLL  = +1;
-int DIR_R_ANKLE_PITCH = +1;
+int DIR_R_ANKLE_ROLL  = -1;
+int DIR_R_ANKLE_PITCH = -1;
 int DIR_R_KNEE_PITCH  = +1;
-int DIR_R_HIP_PITCH   = +1;
-int DIR_R_HIP_ROLL    = +1;
+int DIR_R_HIP_PITCH   = -1;
+int DIR_R_HIP_ROLL    = -1;
 
 // ===== DIR registry =====
 enum DirIndex {
