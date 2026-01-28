@@ -1,7 +1,8 @@
 #include <Wire.h>
 #include <Adafruit_PWMServoDriver.h>
 #include <WiFi.h>
-#include <WebServer.h>
+#include <AsyncTCP.h>
+#include <ESPAsyncWebServer.h>
 
 Adafruit_PWMServoDriver pwm(0x40);
 #define SERVO_FREQ 50
@@ -9,7 +10,7 @@ Adafruit_PWMServoDriver pwm(0x40);
 // ===== WiFi =====
 const char* WIFI_SSID = "Boomx_2.4G";
 const char* WIFI_PASS = "11111111";
-WebServer server(80);
+AsyncWebServer server(80);
 
 // ===== Safety =====
 volatile bool ESTOP_ACTIVE = false;
@@ -297,66 +298,66 @@ void setupWifiAndWeb() {
   Serial.print("IP: ");
   Serial.println(WiFi.localIP());
 
-  server.on("/", []() {
-    server.send_P(200, "text/html", INDEX_HTML);
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
+    request->send_P(200, "text/html", INDEX_HTML);
   });
 
-  server.on("/state", []() {
-    server.send(200, "application/json", buildStateJson());
+  server.on("/state", HTTP_GET, [](AsyncWebServerRequest *request) {
+    request->send(200, "application/json", buildStateJson());
   });
 
-  server.on("/pid", []() {
-    server.send(200, "application/json", buildPidJson());
+  server.on("/pid", HTTP_GET, [](AsyncWebServerRequest *request) {
+    request->send(200, "application/json", buildPidJson());
   });
 
-  server.on("/safety", []() {
-    server.send(200, "application/json", buildSafetyJson());
+  server.on("/safety", HTTP_GET, [](AsyncWebServerRequest *request) {
+    request->send(200, "application/json", buildSafetyJson());
   });
 
-  server.on("/set", []() {
-    if (!server.hasArg("joint") || !server.hasArg("dir")) {
-      server.send(400, "text/plain", "missing args");
+  server.on("/set", HTTP_GET, [](AsyncWebServerRequest *request) {
+    if (!request->hasParam("joint") || !request->hasParam("dir")) {
+      request->send(400, "text/plain", "missing args");
       return;
     }
-    String joint = server.arg("joint");
-    int dir = server.arg("dir").toInt();
+    String joint = request->getParam("joint")->value();
+    int dir = request->getParam("dir")->value().toInt();
     if (dir != 1 && dir != -1) {
-      server.send(400, "text/plain", "dir must be 1 or -1");
+      request->send(400, "text/plain", "dir must be 1 or -1");
       return;
     }
     int idx = findDirIndex(joint);
     if (idx < 0) {
-      server.send(404, "text/plain", "joint not found");
+      request->send(404, "text/plain", "joint not found");
       return;
     }
     *DIR_PTRS[idx] = dir;
-    server.send(200, "application/json", buildStateJson());
+    request->send(200, "application/json", buildStateJson());
   });
 
-  server.on("/test", []() {
+  server.on("/test", HTTP_GET, [](AsyncWebServerRequest *request) {
     if (ESTOP_ACTIVE) {
-      server.send(423, "text/plain", "estop active");
+      request->send(423, "text/plain", "estop active");
       return;
     }
-    if (!server.hasArg("joint")) {
-      server.send(400, "text/plain", "missing joint");
+    if (!request->hasParam("joint")) {
+      request->send(400, "text/plain", "missing joint");
       return;
     }
-    String joint = server.arg("joint");
+    String joint = request->getParam("joint")->value();
     int idx = findDirIndex(joint);
     if (idx < 0) {
-      server.send(404, "text/plain", "joint not found");
+      request->send(404, "text/plain", "joint not found");
       return;
     }
     int dir = *DIR_PTRS[idx];
     int sign = 1;
     int deg = 10;
-    if (server.hasArg("sign")) {
-      sign = server.arg("sign").toInt();
+    if (request->hasParam("sign")) {
+      sign = request->getParam("sign")->value().toInt();
       if (sign != 1 && sign != -1) sign = 1;
     }
-    if (server.hasArg("deg")) {
-      deg = server.arg("deg").toInt();
+    if (request->hasParam("deg")) {
+      deg = request->getParam("deg")->value().toInt();
       if (deg < 1) deg = 1;
       if (deg > 45) deg = 45;
     }
@@ -373,32 +374,32 @@ void setupWifiAndWeb() {
     else if (joint == "R_HIP_ROLL") ch = R_HIP_ROLL;
 
     if (ch == 255) {
-      server.send(404, "text/plain", "channel not found");
+      request->send(404, "text/plain", "channel not found");
       return;
     }
     bump(ch, dir * sign, deg);
-    server.send(200, "text/plain", "ok");
+    request->send(200, "text/plain", "ok");
   });
 
-  server.on("/estop", []() {
-    if (!server.hasArg("on")) {
-      server.send(400, "text/plain", "missing on");
+  server.on("/estop", HTTP_GET, [](AsyncWebServerRequest *request) {
+    if (!request->hasParam("on")) {
+      request->send(400, "text/plain", "missing on");
       return;
     }
-    bool on = server.arg("on").toInt() == 1;
+    bool on = request->getParam("on")->value().toInt() == 1;
     applyEmergencyStop(on);
-    server.send(200, "application/json", buildSafetyJson());
+    request->send(200, "application/json", buildSafetyJson());
   });
 
-  server.on("/set_pid", []() {
-    if (!server.hasArg("kp") || !server.hasArg("ki") || !server.hasArg("kd")) {
-      server.send(400, "text/plain", "missing args");
+  server.on("/set_pid", HTTP_GET, [](AsyncWebServerRequest *request) {
+    if (!request->hasParam("kp") || !request->hasParam("ki") || !request->hasParam("kd")) {
+      request->send(400, "text/plain", "missing args");
       return;
     }
-    PID_KP = server.arg("kp").toFloat();
-    PID_KI = server.arg("ki").toFloat();
-    PID_KD = server.arg("kd").toFloat();
-    server.send(200, "application/json", buildPidJson());
+    PID_KP = request->getParam("kp")->value().toFloat();
+    PID_KI = request->getParam("ki")->value().toFloat();
+    PID_KD = request->getParam("kd")->value().toFloat();
+    request->send(200, "application/json", buildPidJson());
   });
 
   server.begin();
@@ -413,11 +414,7 @@ int degToUs(int deg) {
 }
 
 void delayWithWeb(unsigned long ms) {
-  unsigned long start = millis();
-  while (millis() - start < ms) {
-    server.handleClient();
-    delay(5);
-  }
+  delay(ms);
 }
 
 void applyEmergencyStop(bool active) {
@@ -457,6 +454,5 @@ void setup() {
 }
 
 void loop() {
-  server.handleClient();
   delay(5);
 }
