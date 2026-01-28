@@ -11,6 +11,7 @@ Adafruit_PWMServoDriver pwm(0x40);
 const char* WIFI_SSID = "Boomx_2.4G";
 const char* WIFI_PASS = "11111111";
 AsyncWebServer server(80);
+AsyncEventSource events("/events");
 
 // ===== Safety =====
 volatile bool ESTOP_ACTIVE = false;
@@ -202,6 +203,28 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
     ];
 
     const grid = document.getElementById('grid');
+    const testgrid = document.getElementById('testgrid');
+    const estopState = document.getElementById('estopState');
+
+    function renderState(state){
+      grid.innerHTML='';
+      names.forEach(n => grid.appendChild(card(n, state[n])));
+    }
+
+    function renderTestGrid(){
+      testgrid.innerHTML='';
+      names.forEach(n => testgrid.appendChild(testCard(n)));
+    }
+
+    function renderPid(pid){
+      document.getElementById('kp').value = pid.kp;
+      document.getElementById('ki').value = pid.ki;
+      document.getElementById('kd').value = pid.kd;
+    }
+
+    function renderSafety(s){
+      estopState.textContent = s.estop ? 'ESTOP: ON' : 'ESTOP: OFF';
+    }
 
     function card(name, val){
       const div = document.createElement('div');
@@ -233,25 +256,20 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
     async function load(){
       const res = await fetch('/state');
       const data = await res.json();
-      grid.innerHTML='';
-      names.forEach(n => grid.appendChild(card(n, data[n])));
-      const testgrid = document.getElementById('testgrid');
-      testgrid.innerHTML='';
-      names.forEach(n => testgrid.appendChild(testCard(n)));
+      renderState(data);
+      renderTestGrid();
     }
 
     async function loadPid(){
       const res = await fetch('/pid');
       const pid = await res.json();
-      document.getElementById('kp').value = pid.kp;
-      document.getElementById('ki').value = pid.ki;
-      document.getElementById('kd').value = pid.kd;
+      renderPid(pid);
     }
 
     async function loadSafety(){
       const res = await fetch('/safety');
       const s = await res.json();
-      document.getElementById('estopState').textContent = s.estop ? 'ESTOP: ON' : 'ESTOP: OFF';
+      renderSafety(s);
     }
 
     async function savePid(){
@@ -279,8 +297,20 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
     load();
     loadPid();
     loadSafety();
-    setInterval(load, 2000);
-    setInterval(loadSafety, 2000);
+
+    const es = new EventSource('/events');
+    es.addEventListener('state', (e) => {
+      const data = JSON.parse(e.data);
+      renderState(data);
+    });
+    es.addEventListener('pid', (e) => {
+      const data = JSON.parse(e.data);
+      renderPid(data);
+    });
+    es.addEventListener('safety', (e) => {
+      const data = JSON.parse(e.data);
+      renderSafety(data);
+    });
   </script>
 </body>
 </html>
@@ -331,6 +361,7 @@ void setupWifiAndWeb() {
       return;
     }
     *DIR_PTRS[idx] = dir;
+    events.send(buildStateJson().c_str(), "state");
     request->send(200, "application/json", buildStateJson());
   });
 
@@ -388,6 +419,7 @@ void setupWifiAndWeb() {
     }
     bool on = request->getParam("on")->value().toInt() == 1;
     applyEmergencyStop(on);
+    events.send(buildSafetyJson().c_str(), "safety");
     request->send(200, "application/json", buildSafetyJson());
   });
 
@@ -399,8 +431,20 @@ void setupWifiAndWeb() {
     PID_KP = request->getParam("kp")->value().toFloat();
     PID_KI = request->getParam("ki")->value().toFloat();
     PID_KD = request->getParam("kd")->value().toFloat();
+    events.send(buildPidJson().c_str(), "pid");
     request->send(200, "application/json", buildPidJson());
   });
+
+  events.onConnect([](AsyncEventSourceClient *client) {
+    if (client->lastId()) {
+      Serial.printf("SSE client reconnected, lastId: %u\n", client->lastId());
+    }
+    client->send(buildStateJson().c_str(), "state");
+    client->send(buildPidJson().c_str(), "pid");
+    client->send(buildSafetyJson().c_str(), "safety");
+  });
+
+  server.addHandler(&events);
 
   server.begin();
 }
@@ -431,6 +475,7 @@ void applyEmergencyStop(bool active) {
     pwm.writeMicroseconds(R_HIP_PITCH, US_CENTER);
     pwm.writeMicroseconds(R_HIP_ROLL, US_CENTER);
   }
+  events.send(buildSafetyJson().c_str(), "safety");
 }
 
 void bump(uint8_t ch, int dir, int deg) {
@@ -454,5 +499,12 @@ void setup() {
 }
 
 void loop() {
+  static unsigned long lastPush = 0;
+  unsigned long now = millis();
+  if (now - lastPush >= 1000) {
+    lastPush = now;
+    events.send(buildStateJson().c_str(), "state");
+    events.send(buildSafetyJson().c_str(), "safety");
+  }
   delay(5);
 }
