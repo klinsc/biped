@@ -1,4 +1,5 @@
 #include <Wire.h>
+#include <math.h>
 #include <Adafruit_PWMServoDriver.h>
 #include <WiFi.h>
 #include <AsyncTCP.h>
@@ -35,17 +36,32 @@ Adafruit_MPU6050 mpu;
 // ===== IMU =====
 volatile float IMU_ROLL = 0.0f;
 volatile float IMU_PITCH = 0.0f;
+volatile float IMU_LAST_DT = 0.0f;
+volatile bool IMU_UPDATED = false;
+volatile bool IMU_VALID = false;
+unsigned long lastImuMs = 0;
 float GYRO_BIAS_X = 0.0f;
 float GYRO_BIAS_Y = 0.0f;
 float GYRO_BIAS_Z = 0.0f;
 unsigned long lastImuMicros = 0;
 const float IMU_ALPHA = 0.98f;
 const unsigned long IMU_DT_US = 5000; // 200 Hz
+const float IMU_MAX_ABS_ROLL = 60.0f;
+const float IMU_MAX_ABS_PITCH = 60.0f;
+const unsigned long IMU_STALE_MS = 200;
 
 // ===== PID (soft defaults) =====
 volatile float PID_KP = 0.6f;
 volatile float PID_KI = 0.02f;
 volatile float PID_KD = 0.08f;
+volatile bool PID_ACTIVE = true;
+volatile bool PID_SUSPEND = false;
+const float PID_MAX_OUT_DEG = 12.0f;
+const float PID_I_LIMIT = 20.0f;
+const float PID_ANKLE_GAIN = 0.6f;
+const float PID_HIP_GAIN = 0.4f;
+int PID_ROLL_SIGN = 1;
+int PID_PITCH_SIGN = 1;
 
 // ===== LEFT LEG =====
 #define L_ANKLE_ROLL   0
@@ -65,6 +81,11 @@ volatile float PID_KD = 0.08f;
 const int US_CENTER = 1500;
 const int US_MIN = 1000;
 const int US_MAX = 2000;
+
+// ===== Soft limits (deg around offset) =====
+// Adjust per joint to match safe mechanical range.
+const int CH_MIN_DEG[10] = {-25, -25, -25, -25, -25, -25, -25, -25, -25, -25};
+const int CH_MAX_DEG[10] = { 25,  25,  25,  25,  25,  25,  25,  25,  25,  25};
 
 // ===== DIR (+1 / -1) =====
 // ถ้าข้อไหนผิด → เปลี่ยนเครื่องหมายตัวนั้นตัวเดียว
@@ -138,6 +159,10 @@ const int CHANNEL_TO_DIR_IDX[10] = {
 
 void bump(uint8_t ch, int dir, int deg = 10);
 void applyEmergencyStop(bool active);
+void resetPidState();
+void applyBalancePid(float dt);
+bool imuIsValid(float roll, float pitch);
+int clampTargetDeg(uint8_t ch, int targetDeg);
 
 int findDirIndex(const String& name) {
   for (int i = 0; i < DIR_COUNT; i++) {
@@ -258,6 +283,10 @@ void updateImu() {
 
   IMU_ROLL = IMU_ALPHA * roll + (1.0f - IMU_ALPHA) * rollAcc;
   IMU_PITCH = IMU_ALPHA * pitch + (1.0f - IMU_ALPHA) * pitchAcc;
+  IMU_LAST_DT = dt;
+  IMU_VALID = imuIsValid(IMU_ROLL, IMU_PITCH);
+  lastImuMs = millis();
+  IMU_UPDATED = true;
 }
 
 const char INDEX_HTML[] PROGMEM = R"HTML(
@@ -340,6 +369,10 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
 
   <h2 style="margin-top:18px">IMU 3D View</h2>
   <div class="muted">แสดงทิศทางจาก GY-87 (roll/pitch)</div>
+  <div class="row" style="margin-top:8px">
+    <button class="pos" id="btnCalibrateImu" onclick="calibrateImu()">Calibrate IMU</button>
+    <span id="imuCalStatus" class="muted"></span>
+  </div>
   <div class="row" style="margin-top:8px">
     <div class="viewer">
       <div id="cube" class="cube">
@@ -470,6 +503,23 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
       }
     }
 
+    async function calibrateImu(){
+      const btn = document.getElementById('btnCalibrateImu');
+      const status = document.getElementById('imuCalStatus');
+      btn.disabled = true;
+      status.textContent = 'Calibrating...';
+      try {
+        const res = await fetch('/calibrate_imu');
+        if (!res.ok) throw new Error('fail');
+        status.textContent = 'Done';
+      } catch (e) {
+        status.textContent = 'Failed';
+      } finally {
+        setTimeout(() => { status.textContent = ''; }, 1500);
+        btn.disabled = false;
+      }
+    }
+
     async function testJoint(name, sign){
       const deg = document.getElementById('degStep').value || 10;
       await fetch(`/test?joint=${encodeURIComponent(name)}&deg=${encodeURIComponent(deg)}&sign=${sign}`);
@@ -576,6 +626,19 @@ void setupWifiAndWeb() {
 
   server.on("/imu", HTTP_GET, [](AsyncWebServerRequest *request) {
     request->send(200, "application/json", buildImuJson());
+  });
+
+  server.on("/calibrate_imu", HTTP_GET, [](AsyncWebServerRequest *request) {
+    applyEmergencyStop(true);
+    PID_SUSPEND = true;
+    resetPidState();
+    calibrateGyroBias();
+    lastImuMicros = micros();
+    IMU_UPDATED = false;
+    IMU_VALID = false;
+    lastImuMs = millis();
+    PID_SUSPEND = false;
+    request->send(200, "text/plain", "ok");
   });
 
   server.on("/set", HTTP_GET, [](AsyncWebServerRequest *request) {
@@ -688,6 +751,7 @@ void setupWifiAndWeb() {
     PID_KP = request->getParam("kp")->value().toFloat();
     PID_KI = request->getParam("ki")->value().toFloat();
     PID_KD = request->getParam("kd")->value().toFloat();
+    resetPidState();
     request->send(200, "application/json", buildPidJson());
   });
 
@@ -749,12 +813,95 @@ int centerUsForChannel(uint8_t ch) {
   return degToUs(offset);
 }
 
+bool imuIsValid(float roll, float pitch) {
+  if (!isfinite(roll) || !isfinite(pitch)) return false;
+  if (fabsf(roll) > IMU_MAX_ABS_ROLL) return false;
+  if (fabsf(pitch) > IMU_MAX_ABS_PITCH) return false;
+  return true;
+}
+
+int clampTargetDeg(uint8_t ch, int targetDeg) {
+  if (ch >= 10) return targetDeg;
+  int offset = getOffsetDegForChannel(ch);
+  int minAbs = offset + CH_MIN_DEG[ch];
+  int maxAbs = offset + CH_MAX_DEG[ch];
+  if (targetDeg < minAbs) return minAbs;
+  if (targetDeg > maxAbs) return maxAbs;
+  return targetDeg;
+}
+
+// ===== PID state =====
+float pidRollI = 0.0f;
+float pidPitchI = 0.0f;
+float pidRollPrevErr = 0.0f;
+float pidPitchPrevErr = 0.0f;
+
+void resetPidState() {
+  pidRollI = 0.0f;
+  pidPitchI = 0.0f;
+  pidRollPrevErr = 0.0f;
+  pidPitchPrevErr = 0.0f;
+}
+
+void setServoDeg(uint8_t ch, int dir, float deg) {
+  int offset = getOffsetDegForChannel(ch);
+  int target = (int)roundf(offset + (dir * deg));
+  target = clampTargetDeg(ch, target);
+  pwm.writeMicroseconds(ch, degToUs(target));
+}
+
+void applyBalancePid(float dt) {
+  if (!PID_ACTIVE || PID_SUSPEND || ESTOP_ACTIVE) return;
+  if (dt <= 0.0f) return;
+
+  float errRoll = 0.0f - IMU_ROLL;
+  float errPitch = 0.0f - IMU_PITCH;
+
+  pidRollI += errRoll * dt;
+  pidPitchI += errPitch * dt;
+  if (pidRollI > PID_I_LIMIT) pidRollI = PID_I_LIMIT;
+  if (pidRollI < -PID_I_LIMIT) pidRollI = -PID_I_LIMIT;
+  if (pidPitchI > PID_I_LIMIT) pidPitchI = PID_I_LIMIT;
+  if (pidPitchI < -PID_I_LIMIT) pidPitchI = -PID_I_LIMIT;
+
+  float dRoll = (errRoll - pidRollPrevErr) / dt;
+  float dPitch = (errPitch - pidPitchPrevErr) / dt;
+  pidRollPrevErr = errRoll;
+  pidPitchPrevErr = errPitch;
+
+  float outRoll = (PID_KP * errRoll) + (PID_KI * pidRollI) + (PID_KD * dRoll);
+  float outPitch = (PID_KP * errPitch) + (PID_KI * pidPitchI) + (PID_KD * dPitch);
+
+  if (outRoll > PID_MAX_OUT_DEG) outRoll = PID_MAX_OUT_DEG;
+  if (outRoll < -PID_MAX_OUT_DEG) outRoll = -PID_MAX_OUT_DEG;
+  if (outPitch > PID_MAX_OUT_DEG) outPitch = PID_MAX_OUT_DEG;
+  if (outPitch < -PID_MAX_OUT_DEG) outPitch = -PID_MAX_OUT_DEG;
+
+  outRoll *= PID_ROLL_SIGN;
+  outPitch *= PID_PITCH_SIGN;
+
+  // Roll: left/right opposite
+  setServoDeg(L_ANKLE_ROLL, DIR_L_ANKLE_ROLL, outRoll * PID_ANKLE_GAIN);
+  setServoDeg(R_ANKLE_ROLL, DIR_R_ANKLE_ROLL, -outRoll * PID_ANKLE_GAIN);
+  setServoDeg(L_HIP_ROLL, DIR_L_HIP_ROLL, outRoll * PID_HIP_GAIN);
+  setServoDeg(R_HIP_ROLL, DIR_R_HIP_ROLL, -outRoll * PID_HIP_GAIN);
+
+  // Pitch: left/right same direction
+  setServoDeg(L_ANKLE_PITCH, DIR_L_ANKLE_PITCH, outPitch * PID_ANKLE_GAIN);
+  setServoDeg(R_ANKLE_PITCH, DIR_R_ANKLE_PITCH, outPitch * PID_ANKLE_GAIN);
+  setServoDeg(L_HIP_PITCH, DIR_L_HIP_PITCH, outPitch * PID_HIP_GAIN);
+  setServoDeg(R_HIP_PITCH, DIR_R_HIP_PITCH, outPitch * PID_HIP_GAIN);
+}
+
 void delayWithWeb(unsigned long ms) {
   delay(ms);
 }
 
 void applyEmergencyStop(bool active) {
   ESTOP_ACTIVE = active;
+  if (active) {
+    resetPidState();
+  }
   if (active) {
     pwm.writeMicroseconds(L_ANKLE_ROLL, centerUsForChannel(L_ANKLE_ROLL));
     pwm.writeMicroseconds(L_ANKLE_PITCH, centerUsForChannel(L_ANKLE_PITCH));
@@ -771,11 +918,15 @@ void applyEmergencyStop(bool active) {
 
 void bump(uint8_t ch, int dir, int deg) {
   if (ESTOP_ACTIVE) return;
+  PID_SUSPEND = true;
   int offset = getOffsetDegForChannel(ch);
-  pwm.writeMicroseconds(ch, degToUs(offset + (dir * deg)));
+  int target = offset + (dir * deg);
+  target = clampTargetDeg(ch, target);
+  pwm.writeMicroseconds(ch, degToUs(target));
   delayWithWeb(1200);
   pwm.writeMicroseconds(ch, centerUsForChannel(ch));
   delayWithWeb(800);
+  PID_SUSPEND = false;
 }
 
 void setup() {
@@ -795,5 +946,16 @@ void setup() {
 
 void loop() {
   updateImu();
+  if (millis() - lastImuMs > IMU_STALE_MS) {
+    applyEmergencyStop(true);
+  }
+  if (IMU_UPDATED) {
+    IMU_UPDATED = false;
+    if (IMU_VALID) {
+      applyBalancePid(IMU_LAST_DT);
+    } else {
+      applyEmergencyStop(true);
+    }
+  }
   delay(1);
 }
