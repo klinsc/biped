@@ -3,6 +3,8 @@
 #include <WiFi.h>
 #include <AsyncTCP.h>
 #include <ESPAsyncWebServer.h>
+#include <Preferences.h>
+#include <Update.h>
 
 Adafruit_PWMServoDriver pwm(0x40);
 #define SERVO_FREQ 50
@@ -11,10 +13,21 @@ Adafruit_PWMServoDriver pwm(0x40);
 const char* WIFI_SSID = "Boomx_2.4G";
 const char* WIFI_PASS = "11111111";
 AsyncWebServer server(80);
-AsyncWebSocket ws("/ws");
+const IPAddress STATIC_IP(192, 168, 1, 163);
+const IPAddress GATEWAY(192, 168, 1, 1);
+const IPAddress SUBNET(255, 255, 255, 0);
+const IPAddress DNS1(192, 168, 1, 1);
+const IPAddress DNS2(8, 8, 8, 8);
 
 // ===== Safety =====
 volatile bool ESTOP_ACTIVE = false;
+const int MAX_DEG_PER_CMD = 25;           // limit per command
+const unsigned long MIN_CMD_INTERVAL_MS = 250; // rate limit
+unsigned long lastCmdMs = 0;
+const int OFFSET_MIN_DEG = -45;
+const int OFFSET_MAX_DEG = 45;
+
+Preferences prefs;
 
 // ===== PID (soft defaults) =====
 volatile float PID_KP = 0.6f;
@@ -44,15 +57,15 @@ const int US_MAX = 2000;
 // ถ้าข้อไหนผิด → เปลี่ยนเครื่องหมายตัวนั้นตัวเดียว
 int DIR_L_ANKLE_ROLL  = +1;
 int DIR_L_ANKLE_PITCH = +1;
-int DIR_L_KNEE_PITCH  = +1;
+int DIR_L_KNEE_PITCH  = -1;
 int DIR_L_HIP_PITCH   = +1;
 int DIR_L_HIP_ROLL    = +1;
 
-int DIR_R_ANKLE_ROLL  = +1;
-int DIR_R_ANKLE_PITCH = +1;
+int DIR_R_ANKLE_ROLL  = -1;
+int DIR_R_ANKLE_PITCH = -1;
 int DIR_R_KNEE_PITCH  = +1;
-int DIR_R_HIP_PITCH   = +1;
-int DIR_R_HIP_ROLL    = +1;
+int DIR_R_HIP_PITCH   = -1;
+int DIR_R_HIP_ROLL    = -1;
 
 // ===== DIR registry =====
 enum DirIndex {
@@ -95,6 +108,21 @@ int* DIR_PTRS[DIR_COUNT] = {
   &DIR_R_HIP_ROLL
 };
 
+int OFFSETS_DEG[DIR_COUNT] = {0};
+
+const int CHANNEL_TO_DIR_IDX[10] = {
+  DIR_L_ANKLE_ROLL_IDX,
+  DIR_L_ANKLE_PITCH_IDX,
+  DIR_L_KNEE_PITCH_IDX,
+  DIR_L_HIP_PITCH_IDX,
+  DIR_R_ANKLE_ROLL_IDX,
+  DIR_R_ANKLE_PITCH_IDX,
+  DIR_R_KNEE_PITCH_IDX,
+  DIR_R_HIP_PITCH_IDX,
+  DIR_L_HIP_ROLL_IDX,
+  DIR_R_HIP_ROLL_IDX
+};
+
 void bump(uint8_t ch, int dir, int deg = 10);
 void applyEmergencyStop(bool active);
 
@@ -129,6 +157,32 @@ String buildSafetyJson() {
   json += "\"estop\":" + String(ESTOP_ACTIVE ? 1 : 0);
   json += "}";
   return json;
+}
+
+String buildOffsetsJson() {
+  String json = "{";
+  for (int i = 0; i < DIR_COUNT; i++) {
+    json += "\"" + String(DIR_NAMES[i]) + "\":" + String(OFFSETS_DEG[i]);
+    if (i < DIR_COUNT - 1) json += ",";
+  }
+  json += "}";
+  return json;
+}
+
+void loadOffsets() {
+  prefs.begin("offsets", true);
+  for (int i = 0; i < DIR_COUNT; i++) {
+    String key = "o" + String(i);
+    OFFSETS_DEG[i] = prefs.getInt(key.c_str(), 0);
+  }
+  prefs.end();
+}
+
+void saveOffset(int idx) {
+  prefs.begin("offsets", false);
+  String key = "o" + String(idx);
+  prefs.putInt(key.c_str(), OFFSETS_DEG[idx]);
+  prefs.end();
 }
 
 const char INDEX_HTML[] PROGMEM = R"HTML(
@@ -170,6 +224,10 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
   </div>
   <div id="testgrid" class="grid" style="margin-top:12px"></div>
 
+  <h2 style="margin-top:18px">Offset (deg)</h2>
+  <div class="muted">ปรับศูนย์กลไกของแต่ละข้อก่อนจูน PID</div>
+  <div id="offsetgrid" class="grid" style="margin-top:12px"></div>
+
   <h2 style="margin-top:18px">PID Tuning</h2>
   <div class="muted">ปรับได้จริงแบบ realtime (ค่าเริ่มต้นนุ่มๆ)</div>
   <div class="grid" style="margin-top:12px">
@@ -203,28 +261,7 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
     ];
 
     const grid = document.getElementById('grid');
-    const testgrid = document.getElementById('testgrid');
-    const estopState = document.getElementById('estopState');
-
-    function renderState(state){
-      grid.innerHTML='';
-      names.forEach(n => grid.appendChild(card(n, state[n])));
-    }
-
-    function renderTestGrid(){
-      testgrid.innerHTML='';
-      names.forEach(n => testgrid.appendChild(testCard(n)));
-    }
-
-    function renderPid(pid){
-      document.getElementById('kp').value = pid.kp;
-      document.getElementById('ki').value = pid.ki;
-      document.getElementById('kd').value = pid.kd;
-    }
-
-    function renderSafety(s){
-      estopState.textContent = s.estop ? 'ESTOP: ON' : 'ESTOP: OFF';
-    }
+    const offsetgrid = document.getElementById('offsetgrid');
 
     function card(name, val){
       const div = document.createElement('div');
@@ -253,11 +290,32 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
       return div;
     }
 
+    function offsetCard(name, val){
+      const div = document.createElement('div');
+      div.className = 'card';
+      div.innerHTML = `
+        <div class="name">${name}</div>
+        <div class="row">
+          <button class="neg" onclick="setOffset('${name}',-1)">-1</button>
+          <div class="val" id="off-${name}">${val}</div>
+          <button class="pos" onclick="setOffset('${name}',+1)">+1</button>
+        </div>
+      `;
+      return div;
+    }
+
     async function load(){
       const res = await fetch('/state');
       const data = await res.json();
-      renderState(data);
-      renderTestGrid();
+      grid.innerHTML='';
+      names.forEach(n => grid.appendChild(card(n, data[n])));
+      const offRes = await fetch('/offsets');
+      const off = await offRes.json();
+      offsetgrid.innerHTML='';
+      names.forEach(n => offsetgrid.appendChild(offsetCard(n, off[n] ?? 0)));
+      const testgrid = document.getElementById('testgrid');
+      testgrid.innerHTML='';
+      names.forEach(n => testgrid.appendChild(testCard(n)));
     }
 
     async function loadPid(){
@@ -282,6 +340,13 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
     async function setDir(name, val){
       await fetch(`/set?joint=${encodeURIComponent(name)}&dir=${val}`);
       document.getElementById(`val-${name}`).textContent = val;
+    }
+
+    async function setOffset(name, delta){
+      const current = parseInt(document.getElementById(`off-${name}`).textContent || '0', 10);
+      const next = current + delta;
+      await fetch(`/set_offset?joint=${encodeURIComponent(name)}&offset=${encodeURIComponent(next)}`);
+      document.getElementById(`off-${name}`).textContent = next;
     }
 
     async function testJoint(name, sign){
@@ -310,8 +375,58 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
 </html>
 )HTML";
 
+const char UPDATE_HTML[] PROGMEM = R"HTML(
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>OTA Update</title>
+  <style>
+    body{font-family:Arial,Helvetica,sans-serif;margin:20px;background:#0b0f14;color:#e6edf3}
+    .card{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:16px;max-width:480px}
+    input[type=file]{width:100%;margin:8px 0}
+    button{border:0;border-radius:6px;padding:8px 12px;cursor:pointer;background:#238636;color:#fff}
+  </style>
+</head>
+<body>
+  <h2>OTA Update</h2>
+  <div class="card">
+    <form method="POST" action="/update" enctype="multipart/form-data">
+      <input type="file" name="update" accept=".bin" required />
+      <button type="submit">Upload</button>
+    </form>
+    <div style="margin-top:8px" class="muted">อย่าปิดไฟระหว่างอัปโหลด</div>
+  </div>
+</body>
+</html>
+)HTML";
+
+const char UPDATE_DONE_HTML[] PROGMEM = R"HTML(
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <meta http-equiv="refresh" content="3; url=/" />
+  <title>OTA Done</title>
+  <style>
+    body{font-family:Arial,Helvetica,sans-serif;margin:20px;background:#0b0f14;color:#e6edf3}
+    .card{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:16px;max-width:480px}
+  </style>
+</head>
+<body>
+  <h2>Upload complete</h2>
+  <div class="card">
+    <div>กำลังรีสตาร์ต... จะกลับไปหน้าแรกอัตโนมัติ</div>
+  </div>
+</body>
+</html>
+)HTML";
+
 void setupWifiAndWeb() {
   WiFi.mode(WIFI_STA);
+  WiFi.config(STATIC_IP, GATEWAY, SUBNET, DNS1, DNS2);
   WiFi.begin(WIFI_SSID, WIFI_PASS);
   Serial.print("WiFi connecting");
   while (WiFi.status() != WL_CONNECTED) {
@@ -323,7 +438,7 @@ void setupWifiAndWeb() {
   Serial.println(WiFi.localIP());
 
   server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
-    request->send_P(200, "text/html", INDEX_HTML);
+    request->send(200, "text/html", INDEX_HTML);
   });
 
   server.on("/state", HTTP_GET, [](AsyncWebServerRequest *request) {
@@ -336,6 +451,10 @@ void setupWifiAndWeb() {
 
   server.on("/safety", HTTP_GET, [](AsyncWebServerRequest *request) {
     request->send(200, "application/json", buildSafetyJson());
+  });
+
+  server.on("/offsets", HTTP_GET, [](AsyncWebServerRequest *request) {
+    request->send(200, "application/json", buildOffsetsJson());
   });
 
   server.on("/set", HTTP_GET, [](AsyncWebServerRequest *request) {
@@ -365,6 +484,11 @@ void setupWifiAndWeb() {
       request->send(423, "text/plain", "estop active");
       return;
     }
+    unsigned long now = millis();
+    if (now - lastCmdMs < MIN_CMD_INTERVAL_MS) {
+      request->send(429, "text/plain", "rate limited");
+      return;
+    }
     if (!request->hasParam("joint")) {
       request->send(400, "text/plain", "missing joint");
       return;
@@ -385,7 +509,7 @@ void setupWifiAndWeb() {
     if (request->hasParam("deg")) {
       deg = request->getParam("deg")->value().toInt();
       if (deg < 1) deg = 1;
-      if (deg > 45) deg = 45;
+      if (deg > MAX_DEG_PER_CMD) deg = MAX_DEG_PER_CMD;
     }
     uint8_t ch = 255;
     if (joint == "L_ANKLE_ROLL") ch = L_ANKLE_ROLL;
@@ -403,8 +527,28 @@ void setupWifiAndWeb() {
       request->send(404, "text/plain", "channel not found");
       return;
     }
+    lastCmdMs = now;
     bump(ch, dir * sign, deg);
     request->send(200, "text/plain", "ok");
+  });
+
+  server.on("/set_offset", HTTP_GET, [](AsyncWebServerRequest *request) {
+    if (!request->hasParam("joint") || !request->hasParam("offset")) {
+      request->send(400, "text/plain", "missing args");
+      return;
+    }
+    String joint = request->getParam("joint")->value();
+    int offset = request->getParam("offset")->value().toInt();
+    if (offset < OFFSET_MIN_DEG) offset = OFFSET_MIN_DEG;
+    if (offset > OFFSET_MAX_DEG) offset = OFFSET_MAX_DEG;
+    int idx = findDirIndex(joint);
+    if (idx < 0) {
+      request->send(404, "text/plain", "joint not found");
+      return;
+    }
+    OFFSETS_DEG[idx] = offset;
+    saveOffset(idx);
+    request->send(200, "application/json", buildOffsetsJson());
   });
 
   server.on("/estop", HTTP_GET, [](AsyncWebServerRequest *request) {
@@ -432,19 +576,40 @@ void setupWifiAndWeb() {
     request->send(200, "application/json", buildPidJson());
   });
 
-  ws.onEvent([](AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventType type,
-                void *arg, uint8_t *data, size_t len) {
-    if (type == WS_EVT_CONNECT) {
-      String statePayload = String("{\"type\":\"state\",\"data\":") + buildStateJson() + "}";
-      String pidPayload = String("{\"type\":\"pid\",\"data\":") + buildPidJson() + "}";
-      String safetyPayload = String("{\"type\":\"safety\",\"data\":") + buildSafetyJson() + "}";
-      client->text(statePayload);
-      client->text(pidPayload);
-      client->text(safetyPayload);
-    }
+  server.on("/update", HTTP_GET, [](AsyncWebServerRequest *request) {
+    request->send(200, "text/html", UPDATE_HTML);
   });
 
-  server.addHandler(&ws);
+  server.on(
+    "/update",
+    HTTP_POST,
+    [](AsyncWebServerRequest *request) {
+      bool ok = !Update.hasError();
+      request->send(ok ? 200 : 500, "text/html", ok ? UPDATE_DONE_HTML : "FAIL");
+      if (ok) {
+        delay(100);
+        ESP.restart();
+      }
+    },
+    [](AsyncWebServerRequest *request, String filename, size_t index, uint8_t *data, size_t len, bool final) {
+      if (!index) {
+        applyEmergencyStop(true);
+        if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
+          Update.printError(Serial);
+        }
+      }
+      if (!Update.hasError()) {
+        if (Update.write(data, len) != len) {
+          Update.printError(Serial);
+        }
+      }
+      if (final) {
+        if (!Update.end(true)) {
+          Update.printError(Serial);
+        }
+      }
+    }
+  );
 
   server.begin();
 }
@@ -457,6 +622,18 @@ int degToUs(int deg) {
   return us;
 }
 
+int getOffsetDegForChannel(uint8_t ch) {
+  if (ch >= 10) return 0;
+  int idx = CHANNEL_TO_DIR_IDX[ch];
+  if (idx < 0 || idx >= DIR_COUNT) return 0;
+  return OFFSETS_DEG[idx];
+}
+
+int centerUsForChannel(uint8_t ch) {
+  int offset = getOffsetDegForChannel(ch);
+  return degToUs(offset);
+}
+
 void delayWithWeb(unsigned long ms) {
   delay(ms);
 }
@@ -464,16 +641,16 @@ void delayWithWeb(unsigned long ms) {
 void applyEmergencyStop(bool active) {
   ESTOP_ACTIVE = active;
   if (active) {
-    pwm.writeMicroseconds(L_ANKLE_ROLL, US_CENTER);
-    pwm.writeMicroseconds(L_ANKLE_PITCH, US_CENTER);
-    pwm.writeMicroseconds(L_KNEE_PITCH, US_CENTER);
-    pwm.writeMicroseconds(L_HIP_PITCH, US_CENTER);
-    pwm.writeMicroseconds(L_HIP_ROLL, US_CENTER);
-    pwm.writeMicroseconds(R_ANKLE_ROLL, US_CENTER);
-    pwm.writeMicroseconds(R_ANKLE_PITCH, US_CENTER);
-    pwm.writeMicroseconds(R_KNEE_PITCH, US_CENTER);
-    pwm.writeMicroseconds(R_HIP_PITCH, US_CENTER);
-    pwm.writeMicroseconds(R_HIP_ROLL, US_CENTER);
+    pwm.writeMicroseconds(L_ANKLE_ROLL, centerUsForChannel(L_ANKLE_ROLL));
+    pwm.writeMicroseconds(L_ANKLE_PITCH, centerUsForChannel(L_ANKLE_PITCH));
+    pwm.writeMicroseconds(L_KNEE_PITCH, centerUsForChannel(L_KNEE_PITCH));
+    pwm.writeMicroseconds(L_HIP_PITCH, centerUsForChannel(L_HIP_PITCH));
+    pwm.writeMicroseconds(L_HIP_ROLL, centerUsForChannel(L_HIP_ROLL));
+    pwm.writeMicroseconds(R_ANKLE_ROLL, centerUsForChannel(R_ANKLE_ROLL));
+    pwm.writeMicroseconds(R_ANKLE_PITCH, centerUsForChannel(R_ANKLE_PITCH));
+    pwm.writeMicroseconds(R_KNEE_PITCH, centerUsForChannel(R_KNEE_PITCH));
+    pwm.writeMicroseconds(R_HIP_PITCH, centerUsForChannel(R_HIP_PITCH));
+    pwm.writeMicroseconds(R_HIP_ROLL, centerUsForChannel(R_HIP_ROLL));
   }
   String payload = String("{\"type\":\"safety\",\"data\":") + buildSafetyJson() + "}";
   ws.textAll(payload);
@@ -481,9 +658,10 @@ void applyEmergencyStop(bool active) {
 
 void bump(uint8_t ch, int dir, int deg) {
   if (ESTOP_ACTIVE) return;
-  pwm.writeMicroseconds(ch, degToUs(dir * deg));
+  int offset = getOffsetDegForChannel(ch);
+  pwm.writeMicroseconds(ch, degToUs(offset + (dir * deg)));
   delayWithWeb(1200);
-  pwm.writeMicroseconds(ch, US_CENTER);
+  pwm.writeMicroseconds(ch, centerUsForChannel(ch));
   delayWithWeb(800);
 }
 
@@ -493,6 +671,8 @@ void setup() {
   pwm.begin();
   pwm.setPWMFreq(SERVO_FREQ);
   delay(300);
+
+  loadOffsets();
 
   setupWifiAndWeb();
 

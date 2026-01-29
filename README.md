@@ -35,15 +35,15 @@ Kinematic Tree (ASCII)
 
 
 Servo Map Table
-| name          | channel | side | joint       | designation           |
-| ------------- | ------: | ---- | ----------- | --------------------- |
-| L_ANKLE_ROLL  |       0 | L    | ANKLE_ROLL  | Wait for confirmation |
-| L_ANKLE_PITCH |       1 | L    | ANKLE_PITCH | Wait for confirmation |
-| L_KNEE_PITCH  |       2 | L    | KNEE_PITCH  | Wait for confirmation |
-| L_HIP_PITCH   |       3 | L    | HIP_PITCH   | Wait for confirmation |
-| L_HIP_ROLL    |       8 | L    | HIP_ROLL    | Wait for confirmation |
-| R_ANKLE_ROLL  |       4 | R    | ANKLE_ROLL  | Wait for confirmation |
-| R_ANKLE_PITCH |       5 | R    | ANKLE_PITCH | Wait for confirmation |
-| R_KNEE_PITCH  |       6 | R    | KNEE_PITCH  | Wait for confirmation |
-| R_HIP_PITCH   |       7 | R    | HIP_PITCH   | Wait for confirmation |
-| R_HIP_ROLL    |       9 | R    | HIP_ROLL    | Wait for confirmation |
+| name          | channel | side | joint       | designation  |
+| ------------- | ------: | ---- | ----------- | ------------ |
+| L_ANKLE_ROLL  |       0 | L    | ANKLE_ROLL  | +1           |
+| L_ANKLE_PITCH |       1 | L    | ANKLE_PITCH | +1           |
+| L_KNEE_PITCH  |       2 | L    | KNEE_PITCH  | -1           |
+| L_HIP_PITCH   |       3 | L    | HIP_PITCH   | +1           |
+| L_HIP_ROLL    |       8 | L    | HIP_ROLL    | +1           |
+| R_ANKLE_ROLL  |       4 | R    | ANKLE_ROLL  | -1           |
+| R_ANKLE_PITCH |       5 | R    | ANKLE_PITCH | -1           |
+| R_KNEE_PITCH  |       6 | R    | KNEE_PITCH  | +1           |
+| R_HIP_PITCH   |       7 | R    | HIP_PITCH   | -1           |
+| R_HIP_ROLL    |       9 | R    | HIP_ROLL    | -1           |
