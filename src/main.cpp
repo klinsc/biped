@@ -5,6 +5,8 @@
 #include <ESPAsyncWebServer.h>
 #include <Preferences.h>
 #include <Update.h>
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
 
 Adafruit_PWMServoDriver pwm(0x40);
 #define SERVO_FREQ 50
@@ -28,6 +30,17 @@ const int OFFSET_MIN_DEG = -45;
 const int OFFSET_MAX_DEG = 45;
 
 Preferences prefs;
+Adafruit_MPU6050 mpu;
+
+// ===== IMU =====
+volatile float IMU_ROLL = 0.0f;
+volatile float IMU_PITCH = 0.0f;
+float GYRO_BIAS_X = 0.0f;
+float GYRO_BIAS_Y = 0.0f;
+float GYRO_BIAS_Z = 0.0f;
+unsigned long lastImuMicros = 0;
+const float IMU_ALPHA = 0.98f;
+const unsigned long IMU_DT_US = 5000; // 200 Hz
 
 // ===== PID (soft defaults) =====
 volatile float PID_KP = 0.6f;
@@ -169,6 +182,14 @@ String buildOffsetsJson() {
   return json;
 }
 
+String buildImuJson() {
+  String json = "{";
+  json += "\"roll\":" + String(IMU_ROLL, 2) + ",";
+  json += "\"pitch\":" + String(IMU_PITCH, 2);
+  json += "}";
+  return json;
+}
+
 void loadOffsets() {
   prefs.begin("offsets", true);
   for (int i = 0; i < DIR_COUNT; i++) {
@@ -183,6 +204,60 @@ void saveOffset(int idx) {
   String key = "o" + String(idx);
   prefs.putInt(key.c_str(), OFFSETS_DEG[idx]);
   prefs.end();
+}
+
+void calibrateGyroBias() {
+  const int samples = 300;
+  float sumX = 0.0f, sumY = 0.0f, sumZ = 0.0f;
+  sensors_event_t a, g, temp;
+  for (int i = 0; i < samples; i++) {
+    mpu.getEvent(&a, &g, &temp);
+    sumX += g.gyro.x;
+    sumY += g.gyro.y;
+    sumZ += g.gyro.z;
+    delay(2);
+  }
+  GYRO_BIAS_X = sumX / samples;
+  GYRO_BIAS_Y = sumY / samples;
+  GYRO_BIAS_Z = sumZ / samples;
+}
+
+void setupImu() {
+  if (!mpu.begin()) {
+    Serial.println("MPU6050 not found");
+    return;
+  }
+  mpu.setAccelerometerRange(MPU6050_RANGE_2_G);
+  mpu.setGyroRange(MPU6050_RANGE_250_DEG);
+  mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
+  calibrateGyroBias();
+  lastImuMicros = micros();
+}
+
+void updateImu() {
+  unsigned long now = micros();
+  if (now - lastImuMicros < IMU_DT_US) return;
+  float dt = (now - lastImuMicros) / 1000000.0f;
+  lastImuMicros = now;
+
+  sensors_event_t a, g, temp;
+  mpu.getEvent(&a, &g, &temp);
+
+  float axf = a.acceleration.x;
+  float ayf = a.acceleration.y;
+  float azf = a.acceleration.z;
+
+  float rollAcc = atan2f(ayf, azf) * 57.2958f;
+  float pitchAcc = atan2f(-axf, sqrtf(ayf * ayf + azf * azf)) * 57.2958f;
+
+  float gxDps = (g.gyro.x - GYRO_BIAS_X) * 57.2958f;
+  float gyDps = (g.gyro.y - GYRO_BIAS_Y) * 57.2958f;
+
+  float roll = IMU_ROLL + gxDps * dt;
+  float pitch = IMU_PITCH + gyDps * dt;
+
+  IMU_ROLL = IMU_ALPHA * roll + (1.0f - IMU_ALPHA) * rollAcc;
+  IMU_PITCH = IMU_ALPHA * pitch + (1.0f - IMU_ALPHA) * pitchAcc;
 }
 
 const char INDEX_HTML[] PROGMEM = R"HTML(
@@ -204,6 +279,15 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
     .pos{background:#238636;color:#fff}
     .val{min-width:24px;text-align:center;font-weight:bold}
     .muted{opacity:.7;font-size:12px}
+    .viewer{perspective:800px;max-width:320px}
+    .cube{width:160px;height:160px;position:relative;transform-style:preserve-3d;transition:transform .1s linear}
+    .face{position:absolute;width:160px;height:160px;background:#0f1720;border:1px solid #30363d;opacity:.9}
+    .front{transform:translateZ(80px)}
+    .back{transform:rotateY(180deg) translateZ(80px)}
+    .right{transform:rotateY(90deg) translateZ(80px)}
+    .left{transform:rotateY(-90deg) translateZ(80px)}
+    .top{transform:rotateX(90deg) translateZ(80px)}
+    .bottom{transform:rotateX(-90deg) translateZ(80px)}
   </style>
 </head>
 <body>
@@ -251,6 +335,25 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
         <input id="kd" type="number" step="0.01" style="width:100%" />
         <button class="pos" onclick="savePid()">Set</button>
       </div>
+    </div>
+  </div>
+
+  <h2 style="margin-top:18px">IMU 3D View</h2>
+  <div class="muted">แสดงทิศทางจาก GY-87 (roll/pitch)</div>
+  <div class="row" style="margin-top:8px">
+    <div class="viewer">
+      <div id="cube" class="cube">
+        <div class="face front"></div>
+        <div class="face back"></div>
+        <div class="face right"></div>
+        <div class="face left"></div>
+        <div class="face top"></div>
+        <div class="face bottom"></div>
+      </div>
+    </div>
+    <div style="margin-left:16px">
+      <div class="muted">Roll: <span id="imuRoll">0</span>°</div>
+      <div class="muted">Pitch: <span id="imuPitch">0</span>°</div>
     </div>
   </div>
 
@@ -351,6 +454,22 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
       document.getElementById(`off-${name}`).textContent = next;
     }
 
+    async function loadImu(){
+      try {
+        const res = await fetch('/imu');
+        const imu = await res.json();
+        const roll = imu.roll || 0;
+        const pitch = imu.pitch || 0;
+        document.getElementById('imuRoll').textContent = roll.toFixed(1);
+        document.getElementById('imuPitch').textContent = pitch.toFixed(1);
+        const cube = document.getElementById('cube');
+        // mirror view (like looking at a mirror)
+        cube.style.transform = `rotateX(${pitch}deg) rotateZ(${roll}deg)`;
+      } catch (e) {
+        // ignore
+      }
+    }
+
     async function testJoint(name, sign){
       const deg = document.getElementById('degStep').value || 10;
       await fetch(`/test?joint=${encodeURIComponent(name)}&deg=${encodeURIComponent(deg)}&sign=${sign}`);
@@ -364,8 +483,10 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
     load();
     loadPid();
     loadSafety();
+    loadImu();
     setInterval(load, 2000);
     setInterval(loadSafety, 2000);
+    setInterval(loadImu, 100);
   </script>
 </body>
 </html>
@@ -451,6 +572,10 @@ void setupWifiAndWeb() {
 
   server.on("/offsets", HTTP_GET, [](AsyncWebServerRequest *request) {
     request->send(200, "application/json", buildOffsetsJson());
+  });
+
+  server.on("/imu", HTTP_GET, [](AsyncWebServerRequest *request) {
+    request->send(200, "application/json", buildImuJson());
   });
 
   server.on("/set", HTTP_GET, [](AsyncWebServerRequest *request) {
@@ -660,6 +785,7 @@ void setup() {
   pwm.setPWMFreq(SERVO_FREQ);
   delay(300);
 
+  setupImu();
   loadOffsets();
 
   setupWifiAndWeb();
@@ -668,5 +794,6 @@ void setup() {
 }
 
 void loop() {
-  delay(5);
+  updateImu();
+  delay(1);
 }
