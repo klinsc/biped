@@ -291,6 +291,12 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
     async function calibrateImu(){
       const btn = document.getElementById('btnCalibrateImu');
       const status = document.getElementById('imuCalStatus');
+      
+      // Visual feedback: Reset view immediately to show calibration starts
+      document.getElementById('imuRoll').textContent = "0.0";
+      document.getElementById('imuPitch').textContent = "0.0";
+      document.getElementById('cube').style.transform = `rotateX(0deg) rotateZ(0deg)`;
+
       btn.disabled = true;
       status.textContent = 'Calibrating...';
       try {
