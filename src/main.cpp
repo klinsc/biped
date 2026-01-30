@@ -15,8 +15,8 @@
 int MAX_DEG_PER_CMD = 25;           // limit per command
 unsigned long MIN_CMD_INTERVAL_MS = 250; // rate limit
 unsigned long lastCmdMs = 0;
-int OFFSET_MIN_DEG = -45;
-int OFFSET_MAX_DEG = 45;
+int OFFSET_MIN_DEG = -55;
+int OFFSET_MAX_DEG = 55;
 
 portMUX_TYPE dataMux = portMUX_INITIALIZER_UNLOCKED;
 
