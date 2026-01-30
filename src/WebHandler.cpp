@@ -101,9 +101,9 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
   </div>
   
   <h2 style="margin-top:18px">Posture (Squat)</h2>
-  <div class="muted">ปรับระดับการย่อเข่า (0 - 40 deg)</div>
+  <div class="muted">ปรับระดับการย่อเข่า (0 - 60 deg)</div>
   <div class="row" style="margin-top:8px">
-    <input id="squatRange" type="range" min="0" max="40" value="0" style="flex-grow:1" oninput="setSquat(this.value)" onchange="setSquat(this.value)">
+    <input id="squatRange" type="range" min="0" max="60" value="0" style="flex-grow:1" oninput="setSquat(this.value)" onchange="setSquat(this.value)">
     <span id="squatVal" class="val">0</span>
   </div>
 
@@ -585,7 +585,7 @@ void WebHandler::begin() {
     }
     float deg = request->getParam("deg")->value().toFloat();
     if (deg < 0) deg = 0;
-    if (deg > 40) deg = 40; // Limit squat depth
+    if (deg > 60) deg = 60; // Limit squat depth
     
     portENTER_CRITICAL(&dataMux);
     globalState.squatDeg = deg;
