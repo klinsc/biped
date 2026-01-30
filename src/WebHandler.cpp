@@ -99,6 +99,14 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
     <button id="btnTogglePid" class="neg" onclick="togglePid()">Disable PID</button>
     <span id="pidState" class="muted"></span>
   </div>
+  
+  <h2 style="margin-top:18px">Posture (Squat)</h2>
+  <div class="muted">ปรับระดับการย่อเข่า (0 - 40 deg)</div>
+  <div class="row" style="margin-top:8px">
+    <input id="squatRange" type="range" min="0" max="40" value="0" style="flex-grow:1" oninput="setSquat(this.value)" onchange="setSquat(this.value)">
+    <span id="squatVal" class="val">0</span>
+  </div>
+
   <div id="testgrid" class="grid" style="margin-top:12px"></div>
 
   <h2 style="margin-top:18px">Offset (deg)</h2>
@@ -274,6 +282,12 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
     async function togglePid(){
       const res = await fetch('/toggle_pid');
       loadSafety();
+    }
+
+    async function setSquat(val) {
+        document.getElementById('squatVal').textContent = val;
+        // Simple debounce could be added here if needed, but fetch usually handles it ok for low rate
+        await fetch(`/set_squat?deg=${val}`);
     }
 
     async function savePid(type){
@@ -562,6 +576,22 @@ void WebHandler::begin() {
     portEXIT_CRITICAL(&dataMux);
     saveOffset(idx);
     request->send(200, "application/json", buildOffsetsJson());
+  });
+
+  server.on("/set_squat", HTTP_GET, [](AsyncWebServerRequest *request) {
+    if (!request->hasParam("deg")) {
+        request->send(400, "text/plain", "missing deg");
+        return;
+    }
+    float deg = request->getParam("deg")->value().toFloat();
+    if (deg < 0) deg = 0;
+    if (deg > 40) deg = 40; // Limit squat depth
+    
+    portENTER_CRITICAL(&dataMux);
+    globalState.squatDeg = deg;
+    portEXIT_CRITICAL(&dataMux);
+    
+    request->send(200, "text/plain", "ok");
   });
 
   server.on("/estop", HTTP_GET, [](AsyncWebServerRequest *request) {

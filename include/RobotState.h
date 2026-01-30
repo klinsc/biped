@@ -19,6 +19,9 @@ struct RobotState {
     volatile int testDeg = 10;
     unsigned long actionTimer = 0;
 
+    // Posture
+    volatile float squatDeg = 0.0f;
+
     // System flags
     volatile bool pendingRestart = false;
     volatile bool imuCalibrateRequested = false;

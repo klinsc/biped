@@ -124,11 +124,13 @@ int OFFSETS_DEG[DIR_COUNT] = {0};
 // ===== Mixer Output =====
 float pidOutput[DIR_COUNT] = {0};
 float testOutput[DIR_COUNT] = {0};
+float postureOutput[DIR_COUNT] = {0};
 
 void bump(uint8_t ch, int dir, int deg = 10);
 void applyEmergencyStop(bool active);
 void resetPidState();
 void applyBalancePid(float dt);
+void updatePosture(); // New Posture Logic
 bool imuIsValid(float roll, float pitch);
 void loadDirs();
 void saveDir(int idx);
@@ -465,6 +467,25 @@ void applyBalancePid(float dt) {
   pidOutput[R_HIP_PITCH]   = DIR_R_HIP_PITCH   * outPitch * PID_HIP_GAIN;
 }
 
+void updatePosture() {
+  float sq;
+  portENTER_CRITICAL(&dataMux);
+  sq = globalState.squatDeg;
+  portEXIT_CRITICAL(&dataMux);
+  // Simple kinematic approximation for squatting
+  // Knee bends (+sq), Ankle and Hip compensate (-sq/2) to keep torso vertical
+  
+  // Left Leg
+  postureOutput[L_KNEE_PITCH]  = DIR_L_KNEE_PITCH  * sq;
+  postureOutput[L_ANKLE_PITCH] = DIR_L_ANKLE_PITCH * (-sq * 0.5f);
+  postureOutput[L_HIP_PITCH]   = DIR_L_HIP_PITCH   * (-sq * 0.5f);
+
+  // Right Leg
+  postureOutput[R_KNEE_PITCH]  = DIR_R_KNEE_PITCH  * sq;
+  postureOutput[R_ANKLE_PITCH] = DIR_R_ANKLE_PITCH * (-sq * 0.5f);
+  postureOutput[R_HIP_PITCH]   = DIR_R_HIP_PITCH   * (-sq * 0.5f);
+}
+
 void applyServos() {
   bool estop;
   portENTER_CRITICAL(&dataMux);
@@ -481,6 +502,7 @@ void applyServos() {
       for (int i = 0; i < DIR_COUNT; i++) {
         pidOutput[i] = 0;
         testOutput[i] = 0;
+        postureOutput[i] = 0;
         servos.setCenter(i);
       }
       prevEstop = true;
@@ -489,8 +511,10 @@ void applyServos() {
   }
   prevEstop = false;
 
+  updatePosture(); // Calculate posture offset
+
   for (int i = 0; i < DIR_COUNT; i++) {
-    float finalDeg = pidOutput[i] + testOutput[i];
+    float finalDeg = pidOutput[i] + testOutput[i] + postureOutput[i];
     // Use dir=1 because directions are already calculated in the outputs
     servos.setServoDeg(i, 1, finalDeg);
   }
@@ -499,6 +523,7 @@ void applyServos() {
 void applyEmergencyStop(bool active) {
   portENTER_CRITICAL(&dataMux);
   globalState.estopActive = active;
+  if(active) globalState.squatDeg = 0.0f; // Reset squat on E-Stop
   portEXIT_CRITICAL(&dataMux);
   // Actual stopping logic is handled in applyServos (Loop Thread) to prevent races
 }
