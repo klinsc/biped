@@ -92,6 +92,10 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
     <button class="pos" onclick="setEStop(false)">RESET</button>
     <span id="estopState" class="muted"></span>
   </div>
+  <div class="row" style="margin-top:8px">
+    <button id="btnTogglePid" class="neg" onclick="togglePid()">Disable PID</button>
+    <span id="pidState" class="muted"></span>
+  </div>
   <div id="testgrid" class="grid" style="margin-top:12px"></div>
 
   <h2 style="margin-top:18px">Offset (deg)</h2>
@@ -223,6 +227,21 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
       const res = await fetch('/safety');
       const s = await res.json();
       document.getElementById('estopState').textContent = s.estop ? 'ESTOP: ON' : 'ESTOP: OFF';
+      document.getElementById('pidState').textContent = s.pid ? 'PID: ON' : 'PID: OFF';
+      
+      const btnPid = document.getElementById('btnTogglePid');
+      if (s.pid) {
+          btnPid.className = 'neg';
+          btnPid.textContent = "Disable PID";
+      } else {
+          btnPid.className = 'pos';
+          btnPid.textContent = "Enable PID";
+      }
+    }
+    
+    async function togglePid(){
+      const res = await fetch('/toggle_pid');
+      loadSafety();
     }
 
     async function savePid(){
@@ -513,6 +532,13 @@ void WebHandler::begin() {
     }
     bool on = request->getParam("on")->value().toInt() == 1;
     applyEmergencyStop(on);
+    request->send(200, "application/json", buildSafetyJson());
+  });
+
+  server.on("/toggle_pid", HTTP_GET, [](AsyncWebServerRequest *request) {
+    portENTER_CRITICAL(&dataMux);
+    globalState.pidActive = !globalState.pidActive;
+    portEXIT_CRITICAL(&dataMux);
     request->send(200, "application/json", buildSafetyJson());
   });
 

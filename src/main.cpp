@@ -170,13 +170,16 @@ String buildPidJson() {
 
 String buildSafetyJson() {
   String json;
-  json.reserve(32);
+  json.reserve(64);
   bool estop;
+  bool pid;
   portENTER_CRITICAL(&dataMux);
   estop = globalState.estopActive;
+  pid = globalState.pidActive;
   portEXIT_CRITICAL(&dataMux);
   json += "{";
-  json += "\"estop\":" + String(estop ? 1 : 0);
+  json += "\"estop\":" + String(estop ? 1 : 0) + ",";
+  json += "\"pid\":" + String(pid ? 1 : 0);
   json += "}";
   return json;
 }
@@ -389,7 +392,14 @@ void resetPidState() {
 }
 
 void applyBalancePid(float dt) {
-  if (!globalState.pidActive || globalState.pidSuspendCal || globalState.estopActive) return;
+  if (!globalState.pidActive || globalState.pidSuspendCal || globalState.estopActive) {
+    // เมื่อปิด PID ให้เคลียร์ค่า Output เป็น 0 ทั้งหมด เพื่อให้หุ่นกลับไปยืนท่าตรง (Zero Pose)
+    // ซึ่งเหมาะมากสำหรับการจูน Offset เพราะ Servo ยังทำงานอยู่แต่ไม่ถูกกวนด้วย PID
+    for(int i=0; i<DIR_COUNT; i++) pidOutput[i] = 0.0f;
+    resetPidState(); 
+    return;
+  }
+
   if (dt <= 0.0f) return;
 
   float errRoll = 0.0f - IMU_ROLL;
