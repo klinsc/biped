@@ -327,11 +327,13 @@ bool imuIsValid(float roll, float pitch) {
 }
 
 void startTestMotion(uint8_t ch, int dir, int deg) {
+  portENTER_CRITICAL(&dataMux);
   globalState.testChannel = ch;
   globalState.testDir = dir;
   globalState.testDeg = deg;
   globalState.currentAction = BUMP_START;
   globalState.actionTimer = 0;
+  portEXIT_CRITICAL(&dataMux);
 }
 
 void updateTestMotion() {
@@ -430,7 +432,29 @@ void applyBalancePid(float dt) {
 }
 
 void applyServos() {
-  if (globalState.estopActive) return;
+  bool estop;
+  portENTER_CRITICAL(&dataMux);
+  estop = globalState.estopActive;
+  portEXIT_CRITICAL(&dataMux);
+
+  static bool prevEstop = false;
+
+  if (estop) {
+    if (!prevEstop) {
+      // First frame of E-STOP: Clear states and Center servos safely in this thread
+      resetPidState();
+      globalState.currentAction = IDLE;
+      for (int i = 0; i < DIR_COUNT; i++) {
+        pidOutput[i] = 0;
+        testOutput[i] = 0;
+        servos.setCenter(i);
+      }
+      prevEstop = true;
+    }
+    return;
+  }
+  prevEstop = false;
+
   for (int i = 0; i < DIR_COUNT; i++) {
     float finalDeg = pidOutput[i] + testOutput[i];
     // Use dir=1 because directions are already calculated in the outputs
@@ -442,27 +466,7 @@ void applyEmergencyStop(bool active) {
   portENTER_CRITICAL(&dataMux);
   globalState.estopActive = active;
   portEXIT_CRITICAL(&dataMux);
-  if (active) {
-    resetPidState();
-    // Clear outputs
-    for (int i = 0; i < DIR_COUNT; i++) {
-      pidOutput[i] = 0;
-      testOutput[i] = 0;
-    }
-  }
-  if (active) {
-    servos.setCenter(L_ANKLE_ROLL);
-    // ... rest of centers
-    servos.setCenter(L_ANKLE_PITCH);
-    servos.setCenter(L_KNEE_PITCH);
-    servos.setCenter(L_HIP_PITCH);
-    servos.setCenter(L_HIP_ROLL);
-    servos.setCenter(R_ANKLE_ROLL);
-    servos.setCenter(R_ANKLE_PITCH);
-    servos.setCenter(R_KNEE_PITCH);
-    servos.setCenter(R_HIP_PITCH);
-    servos.setCenter(R_HIP_ROLL);
-  }
+  // Actual stopping logic is handled in applyServos (Loop Thread) to prevent races
 }
 
 void bump(uint8_t ch, int dir, int deg) {

@@ -10,7 +10,6 @@ struct RobotState {
     // Shared Flags
     volatile bool estopActive = false;
     volatile bool pidActive = true;
-    volatile bool pidSuspendTest = false;
     volatile bool pidSuspendCal = false;
 
     // Test Motion Context
