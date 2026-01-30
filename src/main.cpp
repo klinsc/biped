@@ -45,10 +45,17 @@ const float IMU_MAX_ABS_ROLL = 60.0f;
 const float IMU_MAX_ABS_PITCH = 60.0f;
 const unsigned long IMU_STALE_MS = 200;
 
-// ===== PID (soft defaults) =====
-volatile float PID_KP = 0.6f;
-volatile float PID_KI = 0.02f;
-volatile float PID_KD = 0.08f;
+// ===== PID (Roll / Pitch separated) =====
+// Roll: ต้องการความแข็ง (High P)
+volatile float PID_ROLL_KP = 1.5f;
+volatile float PID_ROLL_KI = 0.05f;
+volatile float PID_ROLL_KD = 0.05f;
+
+// Pitch: ต้องการความหนืดกันสั่น (Lower P, Higher D)
+volatile float PID_PITCH_KP = 1.0f;
+volatile float PID_PITCH_KI = 0.05f;
+volatile float PID_PITCH_KD = 0.08f;
+
 const float PID_MAX_OUT_DEG = 12.0f;
 const float PID_I_LIMIT = 20.0f;
 const float PID_ANKLE_GAIN = 0.6f;
@@ -153,17 +160,20 @@ String buildStateJson() {
 
 String buildPidJson() {
   String json;
-  json.reserve(96);
-  float kp, ki, kd;
+  json.reserve(128);
+  float r_kp, r_ki, r_kd;
+  float p_kp, p_ki, p_kd;
   portENTER_CRITICAL(&dataMux);
-  kp = PID_KP;
-  ki = PID_KI;
-  kd = PID_KD;
+  r_kp = PID_ROLL_KP; r_ki = PID_ROLL_KI; r_kd = PID_ROLL_KD;
+  p_kp = PID_PITCH_KP; p_ki = PID_PITCH_KI; p_kd = PID_PITCH_KD;
   portEXIT_CRITICAL(&dataMux);
   json += "{";
-  json += "\"kp\":" + String(kp, 3) + ",";
-  json += "\"ki\":" + String(ki, 3) + ",";
-  json += "\"kd\":" + String(kd, 3);
+  json += "\"rkp\":" + String(r_kp, 3) + ",";
+  json += "\"rki\":" + String(r_ki, 3) + ",";
+  json += "\"rkd\":" + String(r_kd, 3) + ",";
+  json += "\"pkp\":" + String(p_kp, 3) + ",";
+  json += "\"pki\":" + String(p_ki, 3) + ",";
+  json += "\"pkd\":" + String(p_kd, 3);
   json += "}";
   return json;
 }
@@ -409,11 +419,11 @@ void applyBalancePid(float dt) {
   if (dt <= 0.0f) return;
 
   // Snapshot PID params safely
-  float Kp, Ki, Kd;
+  float r_Kp, r_Ki, r_Kd;
+  float p_Kp, p_Ki, p_Kd;
   portENTER_CRITICAL(&dataMux);
-  Kp = PID_KP;
-  Ki = PID_KI;
-  Kd = PID_KD;
+  r_Kp = PID_ROLL_KP; r_Ki = PID_ROLL_KI; r_Kd = PID_ROLL_KD;
+  p_Kp = PID_PITCH_KP; p_Ki = PID_PITCH_KI; p_Kd = PID_PITCH_KD;
   portEXIT_CRITICAL(&dataMux);
 
   float errRoll = 0.0f - IMU_ROLL;
@@ -431,8 +441,8 @@ void applyBalancePid(float dt) {
   pidRollPrevErr = errRoll;
   pidPitchPrevErr = errPitch;
 
-  float outRoll = (Kp * errRoll) + (Ki * pidRollI) + (Kd * dRoll);
-  float outPitch = (Kp * errPitch) + (Ki * pidPitchI) + (Kd * dPitch);
+  float outRoll = (r_Kp * errRoll) + (r_Ki * pidRollI) + (r_Kd * dRoll);
+  float outPitch = (p_Kp * errPitch) + (p_Ki * pidPitchI) + (p_Kd * dPitch);
 
   if (outRoll > PID_MAX_OUT_DEG) outRoll = PID_MAX_OUT_DEG;
   if (outRoll < -PID_MAX_OUT_DEG) outRoll = -PID_MAX_OUT_DEG;

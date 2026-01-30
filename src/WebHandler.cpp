@@ -26,9 +26,12 @@ extern int MAX_DEG_PER_CMD;
 extern int OFFSET_MIN_DEG;
 extern int OFFSET_MAX_DEG;
 
-extern volatile float PID_KP;
-extern volatile float PID_KI;
-extern volatile float PID_KD;
+extern volatile float PID_ROLL_KP;
+extern volatile float PID_ROLL_KI;
+extern volatile float PID_ROLL_KD;
+extern volatile float PID_PITCH_KP;
+extern volatile float PID_PITCH_KI;
+extern volatile float PID_PITCH_KD;
 
 extern int* DIR_PTRS[];
 extern int OFFSETS_DEG[];
@@ -102,28 +105,54 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
   <div class="muted">ปรับศูนย์กลไกของแต่ละข้อก่อนจูน PID</div>
   <div id="offsetgrid" class="grid" style="margin-top:12px"></div>
 
-  <h2 style="margin-top:18px">PID Tuning</h2>
-  <div class="muted">ปรับได้จริงแบบ realtime (ค่าเริ่มต้นนุ่มๆ)</div>
+  <h2 style="margin-top:18px">PID Tuning (Roll)</h2>
+  <div class="muted">Side-to-side balance</div>
   <div class="grid" style="margin-top:12px">
     <div class="card">
       <div class="name">Kp</div>
       <div class="row">
-        <input id="kp" type="number" step="0.01" style="width:100%" />
-        <button class="pos" onclick="savePid()">Set</button>
+        <input id="rkp" type="number" step="0.01" style="width:100%" />
+        <button class="pos" onclick="savePid('roll')">Set</button>
       </div>
     </div>
     <div class="card">
       <div class="name">Ki</div>
       <div class="row">
-        <input id="ki" type="number" step="0.01" style="width:100%" />
-        <button class="pos" onclick="savePid()">Set</button>
+        <input id="rki" type="number" step="0.01" style="width:100%" />
+        <button class="pos" onclick="savePid('roll')">Set</button>
       </div>
     </div>
     <div class="card">
       <div class="name">Kd</div>
       <div class="row">
-        <input id="kd" type="number" step="0.01" style="width:100%" />
-        <button class="pos" onclick="savePid()">Set</button>
+        <input id="rkd" type="number" step="0.01" style="width:100%" />
+        <button class="pos" onclick="savePid('roll')">Set</button>
+      </div>
+    </div>
+  </div>
+
+  <h2 style="margin-top:18px">PID Tuning (Pitch)</h2>
+  <div class="muted">Front-to-back balance (Lower Kp, Higher Kd)</div>
+  <div class="grid" style="margin-top:12px">
+    <div class="card">
+      <div class="name">Kp</div>
+      <div class="row">
+        <input id="pkp" type="number" step="0.01" style="width:100%" />
+        <button class="pos" onclick="savePid('pitch')">Set</button>
+      </div>
+    </div>
+    <div class="card">
+      <div class="name">Ki</div>
+      <div class="row">
+        <input id="pki" type="number" step="0.01" style="width:100%" />
+        <button class="pos" onclick="savePid('pitch')">Set</button>
+      </div>
+    </div>
+    <div class="card">
+      <div class="name">Kd</div>
+      <div class="row">
+        <input id="pkd" type="number" step="0.01" style="width:100%" />
+        <button class="pos" onclick="savePid('pitch')">Set</button>
       </div>
     </div>
   </div>
@@ -218,9 +247,12 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
     async function loadPid(){
       const res = await fetch('/pid');
       const pid = await res.json();
-      document.getElementById('kp').value = pid.kp;
-      document.getElementById('ki').value = pid.ki;
-      document.getElementById('kd').value = pid.kd;
+      document.getElementById('rkp').value = pid.rkp;
+      document.getElementById('rki').value = pid.rki;
+      document.getElementById('rkd').value = pid.rkd;
+      document.getElementById('pkp').value = pid.pkp;
+      document.getElementById('pki').value = pid.pki;
+      document.getElementById('pkd').value = pid.pkd;
     }
 
     async function loadSafety(){
@@ -244,11 +276,12 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
       loadSafety();
     }
 
-    async function savePid(){
-      const kp = document.getElementById('kp').value;
-      const ki = document.getElementById('ki').value;
-      const kd = document.getElementById('kd').value;
-      await fetch(`/set_pid?kp=${encodeURIComponent(kp)}&ki=${encodeURIComponent(ki)}&kd=${encodeURIComponent(kd)}`);
+    async function savePid(type){
+      const prefix = type === 'roll' ? 'r' : 'p';
+      const kp = document.getElementById(prefix + 'kp').value;
+      const ki = document.getElementById(prefix + 'ki').value;
+      const kd = document.getElementById(prefix + 'kd').value;
+      await fetch(`/set_pid?type=${type}&kp=${encodeURIComponent(kp)}&ki=${encodeURIComponent(ki)}&kd=${encodeURIComponent(kd)}`);
     }
 
     async function setDir(name, val){
@@ -549,15 +582,27 @@ void WebHandler::begin() {
   });
 
   server.on("/set_pid", HTTP_GET, [](AsyncWebServerRequest *request) {
-    if (!request->hasParam("kp") || !request->hasParam("ki") || !request->hasParam("kd")) {
-      request->send(400, "text/plain", "missing args");
+    if (!request->hasParam("type")) {
+      request->send(400, "text/plain", "missing type");
       return;
     }
+    String type = request->getParam("type")->value();
+    float kp = request->getParam("kp")->value().toFloat();
+    float ki = request->getParam("ki")->value().toFloat();
+    float kd = request->getParam("kd")->value().toFloat();
+
     portENTER_CRITICAL(&dataMux);
-    PID_KP = request->getParam("kp")->value().toFloat();
-    PID_KI = request->getParam("ki")->value().toFloat();
-    PID_KD = request->getParam("kd")->value().toFloat();
+    if (type == "roll") {
+        PID_ROLL_KP = kp;
+        PID_ROLL_KI = ki;
+        PID_ROLL_KD = kd;
+    } else {
+        PID_PITCH_KP = kp;
+        PID_PITCH_KI = ki;
+        PID_PITCH_KD = kd;
+    }
     portEXIT_CRITICAL(&dataMux);
+    
     resetPidState();
     request->send(200, "application/json", buildPidJson());
   });
