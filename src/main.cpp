@@ -473,17 +473,17 @@ void updatePosture() {
   sq = globalState.squatDeg;
   portEXIT_CRITICAL(&dataMux);
   // Simple kinematic approximation for squatting
-  // Knee bends (+sq), Ankle and Hip compensate (-sq/2) to keep torso vertical
+  // Knee bends (-sq), Ankle and Hip compensate (+sq/2) to keep torso vertical
   
   // Left Leg
-  postureOutput[L_KNEE_PITCH]  = DIR_L_KNEE_PITCH  * sq;
-  postureOutput[L_ANKLE_PITCH] = DIR_L_ANKLE_PITCH * (-sq * 0.5f);
-  postureOutput[L_HIP_PITCH]   = DIR_L_HIP_PITCH   * (-sq * 0.5f);
+  postureOutput[L_KNEE_PITCH]  = DIR_L_KNEE_PITCH  * (-sq);
+  postureOutput[L_ANKLE_PITCH] = DIR_L_ANKLE_PITCH * (sq * 0.5f);
+  postureOutput[L_HIP_PITCH]   = DIR_L_HIP_PITCH   * (sq * 0.5f);
 
   // Right Leg
-  postureOutput[R_KNEE_PITCH]  = DIR_R_KNEE_PITCH  * sq;
-  postureOutput[R_ANKLE_PITCH] = DIR_R_ANKLE_PITCH * (-sq * 0.5f);
-  postureOutput[R_HIP_PITCH]   = DIR_R_HIP_PITCH   * (-sq * 0.5f);
+  postureOutput[R_KNEE_PITCH]  = DIR_R_KNEE_PITCH  * (-sq);
+  postureOutput[R_ANKLE_PITCH] = DIR_R_ANKLE_PITCH * (sq * 0.5f);
+  postureOutput[R_HIP_PITCH]   = DIR_R_HIP_PITCH   * (sq * 0.5f);
 }
 
 void applyServos() {
