@@ -1,37 +1,31 @@
 #include <Wire.h>
 #include <math.h>
-#include <Adafruit_PWMServoDriver.h>
-#include <WiFi.h>
-#include <AsyncTCP.h>
-#include <ESPAsyncWebServer.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/portmacro.h>
 #include <Preferences.h>
-#include <Update.h>
 #include <Adafruit_MPU6050.h>
 #include <Adafruit_Sensor.h>
-
-Adafruit_PWMServoDriver pwm(0x40);
-#define SERVO_FREQ 50
-
-// ===== WiFi =====
-const char* WIFI_SSID = "Boomx_2.4G";
-const char* WIFI_PASS = "11111111";
-AsyncWebServer server(80);
-const IPAddress STATIC_IP(192, 168, 1, 163);
-const IPAddress GATEWAY(192, 168, 1, 1);
-const IPAddress SUBNET(255, 255, 255, 0);
-const IPAddress DNS1(192, 168, 1, 1);
-const IPAddress DNS2(8, 8, 8, 8);
+#include "RobotState.h"
+#include "I2CManager.h"
+#include "RobotJoints.h"
+#include "ServoHandler.h"
+#include "WebHandler.h"
 
 // ===== Safety =====
-volatile bool ESTOP_ACTIVE = false;
-const int MAX_DEG_PER_CMD = 25;           // limit per command
-const unsigned long MIN_CMD_INTERVAL_MS = 250; // rate limit
+int MAX_DEG_PER_CMD = 25;           // limit per command
+unsigned long MIN_CMD_INTERVAL_MS = 250; // rate limit
 unsigned long lastCmdMs = 0;
-const int OFFSET_MIN_DEG = -45;
-const int OFFSET_MAX_DEG = 45;
+int OFFSET_MIN_DEG = -45;
+int OFFSET_MAX_DEG = 45;
+
+portMUX_TYPE dataMux = portMUX_INITIALIZER_UNLOCKED;
 
 Preferences prefs;
 Adafruit_MPU6050 mpu;
+RobotState globalState;
+ServoHandler servos;
+WebHandler web;
+SemaphoreHandle_t I2CManager::mutex = nullptr;
 
 // ===== IMU =====
 volatile float IMU_ROLL = 0.0f;
@@ -39,6 +33,7 @@ volatile float IMU_PITCH = 0.0f;
 volatile float IMU_LAST_DT = 0.0f;
 volatile bool IMU_UPDATED = false;
 volatile bool IMU_VALID = false;
+volatile bool IMU_READY = false;
 unsigned long lastImuMs = 0;
 float GYRO_BIAS_X = 0.0f;
 float GYRO_BIAS_Y = 0.0f;
@@ -54,8 +49,6 @@ const unsigned long IMU_STALE_MS = 200;
 volatile float PID_KP = 0.6f;
 volatile float PID_KI = 0.02f;
 volatile float PID_KD = 0.08f;
-volatile bool PID_ACTIVE = true;
-volatile bool PID_SUSPEND = false;
 const float PID_MAX_OUT_DEG = 12.0f;
 const float PID_I_LIMIT = 20.0f;
 const float PID_ANKLE_GAIN = 0.6f;
@@ -63,29 +56,6 @@ const float PID_HIP_GAIN = 0.4f;
 int PID_ROLL_SIGN = 1;
 int PID_PITCH_SIGN = 1;
 
-// ===== LEFT LEG =====
-#define L_ANKLE_ROLL   0
-#define L_ANKLE_PITCH  1
-#define L_KNEE_PITCH   2
-#define L_HIP_PITCH    3
-#define L_HIP_ROLL     8   // เพิ่ม HIP_ROLL
-
-// ===== RIGHT LEG =====
-#define R_ANKLE_ROLL   4
-#define R_ANKLE_PITCH  5
-#define R_KNEE_PITCH   6
-#define R_HIP_PITCH    7
-#define R_HIP_ROLL     9   // เพิ่ม HIP_ROLL
-
-// ===== microseconds =====
-const int US_CENTER = 1500;
-const int US_MIN = 1000;
-const int US_MAX = 2000;
-
-// ===== Soft limits (deg around offset) =====
-// Adjust per joint to match safe mechanical range.
-const int CH_MIN_DEG[10] = {-25, -25, -25, -25, -25, -25, -25, -25, -25, -25};
-const int CH_MAX_DEG[10] = { 25,  25,  25,  25,  25,  25,  25,  25,  25,  25};
 
 // ===== DIR (+1 / -1) =====
 // ถ้าข้อไหนผิด → เปลี่ยนเครื่องหมายตัวนั้นตัวเดียว
@@ -144,25 +114,15 @@ int* DIR_PTRS[DIR_COUNT] = {
 
 int OFFSETS_DEG[DIR_COUNT] = {0};
 
-const int CHANNEL_TO_DIR_IDX[10] = {
-  DIR_L_ANKLE_ROLL_IDX,
-  DIR_L_ANKLE_PITCH_IDX,
-  DIR_L_KNEE_PITCH_IDX,
-  DIR_L_HIP_PITCH_IDX,
-  DIR_R_ANKLE_ROLL_IDX,
-  DIR_R_ANKLE_PITCH_IDX,
-  DIR_R_KNEE_PITCH_IDX,
-  DIR_R_HIP_PITCH_IDX,
-  DIR_L_HIP_ROLL_IDX,
-  DIR_R_HIP_ROLL_IDX
-};
-
 void bump(uint8_t ch, int dir, int deg = 10);
 void applyEmergencyStop(bool active);
 void resetPidState();
 void applyBalancePid(float dt);
 bool imuIsValid(float roll, float pitch);
-int clampTargetDeg(uint8_t ch, int targetDeg);
+void loadDirs();
+void saveDir(int idx);
+void startTestMotion(uint8_t ch, int dir, int deg);
+void updateTestMotion();
 
 int findDirIndex(const String& name) {
   for (int i = 0; i < DIR_COUNT; i++) {
@@ -172,9 +132,15 @@ int findDirIndex(const String& name) {
 }
 
 String buildStateJson() {
-  String json = "{";
+  String json;
+  json.reserve(256);
+  json += "{";
+  int snapshot[DIR_COUNT];
+  portENTER_CRITICAL(&dataMux);
+  for (int i = 0; i < DIR_COUNT; i++) snapshot[i] = *DIR_PTRS[i];
+  portEXIT_CRITICAL(&dataMux);
   for (int i = 0; i < DIR_COUNT; i++) {
-    json += "\"" + String(DIR_NAMES[i]) + "\":" + String(*DIR_PTRS[i]);
+    json += "\"" + String(DIR_NAMES[i]) + "\":" + String(snapshot[i]);
     if (i < DIR_COUNT - 1) json += ",";
   }
   json += "}";
@@ -182,25 +148,45 @@ String buildStateJson() {
 }
 
 String buildPidJson() {
-  String json = "{";
-  json += "\"kp\":" + String(PID_KP, 3) + ",";
-  json += "\"ki\":" + String(PID_KI, 3) + ",";
-  json += "\"kd\":" + String(PID_KD, 3);
+  String json;
+  json.reserve(96);
+  float kp, ki, kd;
+  portENTER_CRITICAL(&dataMux);
+  kp = PID_KP;
+  ki = PID_KI;
+  kd = PID_KD;
+  portEXIT_CRITICAL(&dataMux);
+  json += "{";
+  json += "\"kp\":" + String(kp, 3) + ",";
+  json += "\"ki\":" + String(ki, 3) + ",";
+  json += "\"kd\":" + String(kd, 3);
   json += "}";
   return json;
 }
 
 String buildSafetyJson() {
-  String json = "{";
-  json += "\"estop\":" + String(ESTOP_ACTIVE ? 1 : 0);
+  String json;
+  json.reserve(32);
+  bool estop;
+  portENTER_CRITICAL(&dataMux);
+  estop = globalState.estopActive;
+  portEXIT_CRITICAL(&dataMux);
+  json += "{";
+  json += "\"estop\":" + String(estop ? 1 : 0);
   json += "}";
   return json;
 }
 
 String buildOffsetsJson() {
-  String json = "{";
+  String json;
+  json.reserve(256);
+  int snapshot[DIR_COUNT];
+  portENTER_CRITICAL(&dataMux);
+  for (int i = 0; i < DIR_COUNT; i++) snapshot[i] = OFFSETS_DEG[i];
+  portEXIT_CRITICAL(&dataMux);
+  json += "{";
   for (int i = 0; i < DIR_COUNT; i++) {
-    json += "\"" + String(DIR_NAMES[i]) + "\":" + String(OFFSETS_DEG[i]);
+    json += "\"" + String(DIR_NAMES[i]) + "\":" + String(snapshot[i]);
     if (i < DIR_COUNT - 1) json += ",";
   }
   json += "}";
@@ -208,9 +194,16 @@ String buildOffsetsJson() {
 }
 
 String buildImuJson() {
-  String json = "{";
-  json += "\"roll\":" + String(IMU_ROLL, 2) + ",";
-  json += "\"pitch\":" + String(IMU_PITCH, 2);
+  String json;
+  json.reserve(64);
+  float roll, pitch;
+  portENTER_CRITICAL(&dataMux);
+  roll = IMU_ROLL;
+  pitch = IMU_PITCH;
+  portEXIT_CRITICAL(&dataMux);
+  json += "{";
+  json += "\"roll\":" + String(roll, 2) + ",";
+  json += "\"pitch\":" + String(pitch, 2);
   json += "}";
   return json;
 }
@@ -228,6 +221,26 @@ void saveOffset(int idx) {
   prefs.begin("offsets", false);
   String key = "o" + String(idx);
   prefs.putInt(key.c_str(), OFFSETS_DEG[idx]);
+  prefs.end();
+}
+
+void loadDirs() {
+  prefs.begin("dirs", true);
+  for (int i = 0; i < DIR_COUNT; i++) {
+    String key = "d" + String(i);
+    int defVal = *DIR_PTRS[i];
+    int val = prefs.getInt(key.c_str(), defVal);
+    if (val != 1 && val != -1) val = defVal;
+    *DIR_PTRS[i] = val;
+  }
+  prefs.end();
+}
+
+void saveDir(int idx) {
+  if (idx < 0 || idx >= DIR_COUNT) return;
+  prefs.begin("dirs", false);
+  String key = "d" + String(idx);
+  prefs.putInt(key.c_str(), *DIR_PTRS[idx]);
   prefs.end();
 }
 
@@ -250,6 +263,8 @@ void calibrateGyroBias() {
 void setupImu() {
   if (!mpu.begin()) {
     Serial.println("MPU6050 not found");
+    IMU_READY = false;
+    IMU_VALID = false;
     return;
   }
   mpu.setAccelerometerRange(MPU6050_RANGE_2_G);
@@ -257,9 +272,13 @@ void setupImu() {
   mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
   calibrateGyroBias();
   lastImuMicros = micros();
+  lastImuMs = millis();
+  IMU_READY = true;
+  IMU_VALID = true;
 }
 
 void updateImu() {
+  if (!IMU_READY) return;
   unsigned long now = micros();
   if (now - lastImuMicros < IMU_DT_US) return;
   float dt = (now - lastImuMicros) / 1000000.0f;
@@ -281,538 +300,21 @@ void updateImu() {
   float roll = IMU_ROLL + gxDps * dt;
   float pitch = IMU_PITCH + gyDps * dt;
 
-  IMU_ROLL = IMU_ALPHA * roll + (1.0f - IMU_ALPHA) * rollAcc;
-  IMU_PITCH = IMU_ALPHA * pitch + (1.0f - IMU_ALPHA) * pitchAcc;
+  float nextRoll = IMU_ALPHA * roll + (1.0f - IMU_ALPHA) * rollAcc;
+  float nextPitch = IMU_ALPHA * pitch + (1.0f - IMU_ALPHA) * pitchAcc;
+  bool valid = imuIsValid(nextRoll, nextPitch);
+  portENTER_CRITICAL(&dataMux);
+  IMU_ROLL = nextRoll;
+  IMU_PITCH = nextPitch;
   IMU_LAST_DT = dt;
-  IMU_VALID = imuIsValid(IMU_ROLL, IMU_PITCH);
+  IMU_VALID = valid;
   lastImuMs = millis();
   IMU_UPDATED = true;
+  portEXIT_CRITICAL(&dataMux);
 }
 
-const char INDEX_HTML[] PROGMEM = R"HTML(
-<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>DIR Tuning</title>
-  <style>
-    body{font-family:Arial,Helvetica,sans-serif;margin:20px;background:#0b0f14;color:#e6edf3}
-    h2{margin-bottom:8px}
-    .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px}
-    .card{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:12px}
-    .name{font-weight:bold;margin-bottom:8px}
-    .row{display:flex;align-items:center;gap:10px}
-    button{border:0;border-radius:6px;padding:8px 12px;cursor:pointer}
-    .neg{background:#da3633;color:#fff}
-    .pos{background:#238636;color:#fff}
-    .val{min-width:24px;text-align:center;font-weight:bold}
-    .muted{opacity:.7;font-size:12px}
-    .viewer{perspective:800px;max-width:320px}
-    .cube{width:160px;height:160px;position:relative;transform-style:preserve-3d;transition:transform .1s linear}
-    .face{position:absolute;width:160px;height:160px;background:#0f1720;border:1px solid #30363d;opacity:.9}
-    .front{transform:translateZ(80px)}
-    .back{transform:rotateY(180deg) translateZ(80px)}
-    .right{transform:rotateY(90deg) translateZ(80px)}
-    .left{transform:rotateY(-90deg) translateZ(80px)}
-    .top{transform:rotateX(90deg) translateZ(80px)}
-    .bottom{transform:rotateX(-90deg) translateZ(80px)}
-  </style>
-</head>
-<body>
-  <h2>DIR (+1 / -1) Tuning</h2>
-  <div class="muted">แตะปุ่มเพื่อสลับค่าแบบ realtime</div>
-  <div id="grid" class="grid" style="margin-top:12px"></div>
-
-  <h2 style="margin-top:18px">Manual Test</h2>
-  <div class="muted">กดเพื่อเพิ่ม/ลดมุมทีละข้อต่อ (ใช้ค่า DIR ปัจจุบัน)</div>
-  <div class="row" style="margin-top:8px">
-    <span class="muted">Step (deg)</span>
-    <input id="degStep" type="number" step="1" min="1" max="45" value="10" style="width:80px" />
-  </div>
-  <div class="row" style="margin-top:8px">
-    <button class="neg" onclick="setEStop(true)">EMERGENCY STOP</button>
-    <button class="pos" onclick="setEStop(false)">RESET</button>
-    <span id="estopState" class="muted"></span>
-  </div>
-  <div id="testgrid" class="grid" style="margin-top:12px"></div>
-
-  <h2 style="margin-top:18px">Offset (deg)</h2>
-  <div class="muted">ปรับศูนย์กลไกของแต่ละข้อก่อนจูน PID</div>
-  <div id="offsetgrid" class="grid" style="margin-top:12px"></div>
-
-  <h2 style="margin-top:18px">PID Tuning</h2>
-  <div class="muted">ปรับได้จริงแบบ realtime (ค่าเริ่มต้นนุ่มๆ)</div>
-  <div class="grid" style="margin-top:12px">
-    <div class="card">
-      <div class="name">Kp</div>
-      <div class="row">
-        <input id="kp" type="number" step="0.01" style="width:100%" />
-        <button class="pos" onclick="savePid()">Set</button>
-      </div>
-    </div>
-    <div class="card">
-      <div class="name">Ki</div>
-      <div class="row">
-        <input id="ki" type="number" step="0.01" style="width:100%" />
-        <button class="pos" onclick="savePid()">Set</button>
-      </div>
-    </div>
-    <div class="card">
-      <div class="name">Kd</div>
-      <div class="row">
-        <input id="kd" type="number" step="0.01" style="width:100%" />
-        <button class="pos" onclick="savePid()">Set</button>
-      </div>
-    </div>
-  </div>
-
-  <h2 style="margin-top:18px">IMU 3D View</h2>
-  <div class="muted">แสดงทิศทางจาก GY-87 (roll/pitch)</div>
-  <div class="row" style="margin-top:8px">
-    <button class="pos" id="btnCalibrateImu" onclick="calibrateImu()">Calibrate IMU</button>
-    <span id="imuCalStatus" class="muted"></span>
-  </div>
-  <div class="row" style="margin-top:8px">
-    <div class="viewer">
-      <div id="cube" class="cube">
-        <div class="face front"></div>
-        <div class="face back"></div>
-        <div class="face right"></div>
-        <div class="face left"></div>
-        <div class="face top"></div>
-        <div class="face bottom"></div>
-      </div>
-    </div>
-    <div style="margin-left:16px">
-      <div class="muted">Roll: <span id="imuRoll">0</span>°</div>
-      <div class="muted">Pitch: <span id="imuPitch">0</span>°</div>
-    </div>
-  </div>
-
-  <script>
-    const names = [
-      "L_ANKLE_ROLL","L_ANKLE_PITCH","L_KNEE_PITCH","L_HIP_PITCH","L_HIP_ROLL",
-      "R_ANKLE_ROLL","R_ANKLE_PITCH","R_KNEE_PITCH","R_HIP_PITCH","R_HIP_ROLL"
-    ];
-
-    const grid = document.getElementById('grid');
-    const offsetgrid = document.getElementById('offsetgrid');
-
-    function card(name, val){
-      const div = document.createElement('div');
-      div.className = 'card';
-      div.innerHTML = `
-        <div class="name">${name}</div>
-        <div class="row">
-          <button class="neg" onclick="setDir('${name}',-1)">-1</button>
-          <div class="val" id="val-${name}">${val}</div>
-          <button class="pos" onclick="setDir('${name}',+1)">+1</button>
-        </div>
-      `;
-      return div;
-    }
-
-    function testCard(name){
-      const div = document.createElement('div');
-      div.className = 'card';
-      div.innerHTML = `
-        <div class="name">${name}</div>
-        <div class="row">
-          <button class="neg" onclick="testJoint('${name}',-1)">-</button>
-          <button class="pos" onclick="testJoint('${name}',+1)">+</button>
-        </div>
-      `;
-      return div;
-    }
-
-    function offsetCard(name, val){
-      const div = document.createElement('div');
-      div.className = 'card';
-      div.innerHTML = `
-        <div class="name">${name}</div>
-        <div class="row">
-          <button class="neg" onclick="setOffset('${name}',-1)">-1</button>
-          <div class="val" id="off-${name}">${val}</div>
-          <button class="pos" onclick="setOffset('${name}',+1)">+1</button>
-        </div>
-      `;
-      return div;
-    }
-
-    async function load(){
-      const res = await fetch('/state');
-      const data = await res.json();
-      grid.innerHTML='';
-      names.forEach(n => grid.appendChild(card(n, data[n])));
-      const offRes = await fetch('/offsets');
-      const off = await offRes.json();
-      offsetgrid.innerHTML='';
-      names.forEach(n => offsetgrid.appendChild(offsetCard(n, off[n] ?? 0)));
-      const testgrid = document.getElementById('testgrid');
-      testgrid.innerHTML='';
-      names.forEach(n => testgrid.appendChild(testCard(n)));
-    }
-
-    async function loadPid(){
-      const res = await fetch('/pid');
-      const pid = await res.json();
-      document.getElementById('kp').value = pid.kp;
-      document.getElementById('ki').value = pid.ki;
-      document.getElementById('kd').value = pid.kd;
-    }
-
-    async function loadSafety(){
-      const res = await fetch('/safety');
-      const s = await res.json();
-      document.getElementById('estopState').textContent = s.estop ? 'ESTOP: ON' : 'ESTOP: OFF';
-    }
-
-    async function savePid(){
-      const kp = document.getElementById('kp').value;
-      const ki = document.getElementById('ki').value;
-      const kd = document.getElementById('kd').value;
-      await fetch(`/set_pid?kp=${encodeURIComponent(kp)}&ki=${encodeURIComponent(ki)}&kd=${encodeURIComponent(kd)}`);
-    }
-
-    async function setDir(name, val){
-      await fetch(`/set?joint=${encodeURIComponent(name)}&dir=${val}`);
-      document.getElementById(`val-${name}`).textContent = val;
-    }
-
-    async function setOffset(name, delta){
-      const current = parseInt(document.getElementById(`off-${name}`).textContent || '0', 10);
-      const next = current + delta;
-      await fetch(`/set_offset?joint=${encodeURIComponent(name)}&offset=${encodeURIComponent(next)}`);
-      document.getElementById(`off-${name}`).textContent = next;
-    }
-
-    async function loadImu(){
-      try {
-        const res = await fetch('/imu');
-        const imu = await res.json();
-        const roll = imu.roll || 0;
-        const pitch = imu.pitch || 0;
-        document.getElementById('imuRoll').textContent = roll.toFixed(1);
-        document.getElementById('imuPitch').textContent = pitch.toFixed(1);
-        const cube = document.getElementById('cube');
-        // mirror view (like looking at a mirror)
-        cube.style.transform = `rotateX(${pitch}deg) rotateZ(${roll}deg)`;
-      } catch (e) {
-        // ignore
-      }
-    }
-
-    async function calibrateImu(){
-      const btn = document.getElementById('btnCalibrateImu');
-      const status = document.getElementById('imuCalStatus');
-      btn.disabled = true;
-      status.textContent = 'Calibrating...';
-      try {
-        const res = await fetch('/calibrate_imu');
-        if (!res.ok) throw new Error('fail');
-        status.textContent = 'Done';
-      } catch (e) {
-        status.textContent = 'Failed';
-      } finally {
-        setTimeout(() => { status.textContent = ''; }, 1500);
-        btn.disabled = false;
-      }
-    }
-
-    async function testJoint(name, sign){
-      const deg = document.getElementById('degStep').value || 10;
-      await fetch(`/test?joint=${encodeURIComponent(name)}&deg=${encodeURIComponent(deg)}&sign=${sign}`);
-    }
-
-    async function setEStop(on){
-      await fetch(`/estop?on=${on ? 1 : 0}`);
-      loadSafety();
-    }
-
-    load();
-    loadPid();
-    loadSafety();
-    loadImu();
-    setInterval(load, 2000);
-    setInterval(loadSafety, 2000);
-    setInterval(loadImu, 100);
-  </script>
-</body>
-</html>
-)HTML";
-
-const char UPDATE_HTML[] PROGMEM = R"HTML(
-<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>OTA Update</title>
-  <style>
-    body{font-family:Arial,Helvetica,sans-serif;margin:20px;background:#0b0f14;color:#e6edf3}
-    .card{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:16px;max-width:480px}
-    input[type=file]{width:100%;margin:8px 0}
-    button{border:0;border-radius:6px;padding:8px 12px;cursor:pointer;background:#238636;color:#fff}
-  </style>
-</head>
-<body>
-  <h2>OTA Update</h2>
-  <div class="card">
-    <form method="POST" action="/update" enctype="multipart/form-data">
-      <input type="file" name="update" accept=".bin" required />
-      <button type="submit">Upload</button>
-    </form>
-    <div style="margin-top:8px" class="muted">อย่าปิดไฟระหว่างอัปโหลด</div>
-  </div>
-</body>
-</html>
-)HTML";
-
-const char UPDATE_DONE_HTML[] PROGMEM = R"HTML(
-<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <meta http-equiv="refresh" content="3; url=/" />
-  <title>OTA Done</title>
-  <style>
-    body{font-family:Arial,Helvetica,sans-serif;margin:20px;background:#0b0f14;color:#e6edf3}
-    .card{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:16px;max-width:480px}
-  </style>
-</head>
-<body>
-  <h2>Upload complete</h2>
-  <div class="card">
-    <div>กำลังรีสตาร์ต... จะกลับไปหน้าแรกอัตโนมัติ</div>
-  </div>
-</body>
-</html>
-)HTML";
-
-void setupWifiAndWeb() {
-  WiFi.mode(WIFI_STA);
-  WiFi.config(STATIC_IP, GATEWAY, SUBNET, DNS1, DNS2);
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
-  Serial.print("WiFi connecting");
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
-  }
-  Serial.println();
-  Serial.print("IP: ");
-  Serial.println(WiFi.localIP());
-
-  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
-    request->send(200, "text/html", INDEX_HTML);
-  });
-
-  server.on("/state", HTTP_GET, [](AsyncWebServerRequest *request) {
-    request->send(200, "application/json", buildStateJson());
-  });
-
-  server.on("/pid", HTTP_GET, [](AsyncWebServerRequest *request) {
-    request->send(200, "application/json", buildPidJson());
-  });
-
-  server.on("/safety", HTTP_GET, [](AsyncWebServerRequest *request) {
-    request->send(200, "application/json", buildSafetyJson());
-  });
-
-  server.on("/offsets", HTTP_GET, [](AsyncWebServerRequest *request) {
-    request->send(200, "application/json", buildOffsetsJson());
-  });
-
-  server.on("/imu", HTTP_GET, [](AsyncWebServerRequest *request) {
-    request->send(200, "application/json", buildImuJson());
-  });
-
-  server.on("/calibrate_imu", HTTP_GET, [](AsyncWebServerRequest *request) {
-    applyEmergencyStop(true);
-    PID_SUSPEND = true;
-    resetPidState();
-    calibrateGyroBias();
-    lastImuMicros = micros();
-    IMU_UPDATED = false;
-    IMU_VALID = false;
-    lastImuMs = millis();
-    PID_SUSPEND = false;
-    request->send(200, "text/plain", "ok");
-  });
-
-  server.on("/set", HTTP_GET, [](AsyncWebServerRequest *request) {
-    if (!request->hasParam("joint") || !request->hasParam("dir")) {
-      request->send(400, "text/plain", "missing args");
-      return;
-    }
-    String joint = request->getParam("joint")->value();
-    int dir = request->getParam("dir")->value().toInt();
-    if (dir != 1 && dir != -1) {
-      request->send(400, "text/plain", "dir must be 1 or -1");
-      return;
-    }
-    int idx = findDirIndex(joint);
-    if (idx < 0) {
-      request->send(404, "text/plain", "joint not found");
-      return;
-    }
-    *DIR_PTRS[idx] = dir;
-    request->send(200, "application/json", buildStateJson());
-  });
-
-  server.on("/test", HTTP_GET, [](AsyncWebServerRequest *request) {
-    if (ESTOP_ACTIVE) {
-      request->send(423, "text/plain", "estop active");
-      return;
-    }
-    unsigned long now = millis();
-    if (now - lastCmdMs < MIN_CMD_INTERVAL_MS) {
-      request->send(429, "text/plain", "rate limited");
-      return;
-    }
-    if (!request->hasParam("joint")) {
-      request->send(400, "text/plain", "missing joint");
-      return;
-    }
-    String joint = request->getParam("joint")->value();
-    int idx = findDirIndex(joint);
-    if (idx < 0) {
-      request->send(404, "text/plain", "joint not found");
-      return;
-    }
-    int dir = *DIR_PTRS[idx];
-    int sign = 1;
-    int deg = 10;
-    if (request->hasParam("sign")) {
-      sign = request->getParam("sign")->value().toInt();
-      if (sign != 1 && sign != -1) sign = 1;
-    }
-    if (request->hasParam("deg")) {
-      deg = request->getParam("deg")->value().toInt();
-      if (deg < 1) deg = 1;
-      if (deg > MAX_DEG_PER_CMD) deg = MAX_DEG_PER_CMD;
-    }
-    uint8_t ch = 255;
-    if (joint == "L_ANKLE_ROLL") ch = L_ANKLE_ROLL;
-    else if (joint == "L_ANKLE_PITCH") ch = L_ANKLE_PITCH;
-    else if (joint == "L_KNEE_PITCH") ch = L_KNEE_PITCH;
-    else if (joint == "L_HIP_PITCH") ch = L_HIP_PITCH;
-    else if (joint == "L_HIP_ROLL") ch = L_HIP_ROLL;
-    else if (joint == "R_ANKLE_ROLL") ch = R_ANKLE_ROLL;
-    else if (joint == "R_ANKLE_PITCH") ch = R_ANKLE_PITCH;
-    else if (joint == "R_KNEE_PITCH") ch = R_KNEE_PITCH;
-    else if (joint == "R_HIP_PITCH") ch = R_HIP_PITCH;
-    else if (joint == "R_HIP_ROLL") ch = R_HIP_ROLL;
-
-    if (ch == 255) {
-      request->send(404, "text/plain", "channel not found");
-      return;
-    }
-    lastCmdMs = now;
-    bump(ch, dir * sign, deg);
-    request->send(200, "text/plain", "ok");
-  });
-
-  server.on("/set_offset", HTTP_GET, [](AsyncWebServerRequest *request) {
-    if (!request->hasParam("joint") || !request->hasParam("offset")) {
-      request->send(400, "text/plain", "missing args");
-      return;
-    }
-    String joint = request->getParam("joint")->value();
-    int offset = request->getParam("offset")->value().toInt();
-    if (offset < OFFSET_MIN_DEG) offset = OFFSET_MIN_DEG;
-    if (offset > OFFSET_MAX_DEG) offset = OFFSET_MAX_DEG;
-    int idx = findDirIndex(joint);
-    if (idx < 0) {
-      request->send(404, "text/plain", "joint not found");
-      return;
-    }
-    OFFSETS_DEG[idx] = offset;
-    saveOffset(idx);
-    request->send(200, "application/json", buildOffsetsJson());
-  });
-
-  server.on("/estop", HTTP_GET, [](AsyncWebServerRequest *request) {
-    if (!request->hasParam("on")) {
-      request->send(400, "text/plain", "missing on");
-      return;
-    }
-    bool on = request->getParam("on")->value().toInt() == 1;
-    applyEmergencyStop(on);
-    request->send(200, "application/json", buildSafetyJson());
-  });
-
-  server.on("/set_pid", HTTP_GET, [](AsyncWebServerRequest *request) {
-    if (!request->hasParam("kp") || !request->hasParam("ki") || !request->hasParam("kd")) {
-      request->send(400, "text/plain", "missing args");
-      return;
-    }
-    PID_KP = request->getParam("kp")->value().toFloat();
-    PID_KI = request->getParam("ki")->value().toFloat();
-    PID_KD = request->getParam("kd")->value().toFloat();
-    resetPidState();
-    request->send(200, "application/json", buildPidJson());
-  });
-
-  server.on("/update", HTTP_GET, [](AsyncWebServerRequest *request) {
-    request->send(200, "text/html", UPDATE_HTML);
-  });
-
-  server.on(
-    "/update",
-    HTTP_POST,
-    [](AsyncWebServerRequest *request) {
-      bool ok = !Update.hasError();
-      request->send(ok ? 200 : 500, "text/html", ok ? UPDATE_DONE_HTML : "FAIL");
-      if (ok) {
-        delay(100);
-        ESP.restart();
-      }
-    },
-    [](AsyncWebServerRequest *request, String filename, size_t index, uint8_t *data, size_t len, bool final) {
-      if (!index) {
-        applyEmergencyStop(true);
-        if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
-          Update.printError(Serial);
-        }
-      }
-      if (!Update.hasError()) {
-        if (Update.write(data, len) != len) {
-          Update.printError(Serial);
-        }
-      }
-      if (final) {
-        if (!Update.end(true)) {
-          Update.printError(Serial);
-        }
-      }
-    }
-  );
-
-  server.begin();
-}
 
 // ===== helper =====
-int degToUs(int deg) {
-  long us = US_CENTER + (long)deg * 8; // ~8us/deg
-  if (us < US_MIN) us = US_MIN;
-  if (us > US_MAX) us = US_MAX;
-  return us;
-}
-
-int getOffsetDegForChannel(uint8_t ch) {
-  if (ch >= 10) return 0;
-  int idx = CHANNEL_TO_DIR_IDX[ch];
-  if (idx < 0 || idx >= DIR_COUNT) return 0;
-  return OFFSETS_DEG[idx];
-}
-
-int centerUsForChannel(uint8_t ch) {
-  int offset = getOffsetDegForChannel(ch);
-  return degToUs(offset);
-}
-
 bool imuIsValid(float roll, float pitch) {
   if (!isfinite(roll) || !isfinite(pitch)) return false;
   if (fabsf(roll) > IMU_MAX_ABS_ROLL) return false;
@@ -820,14 +322,54 @@ bool imuIsValid(float roll, float pitch) {
   return true;
 }
 
-int clampTargetDeg(uint8_t ch, int targetDeg) {
-  if (ch >= 10) return targetDeg;
-  int offset = getOffsetDegForChannel(ch);
-  int minAbs = offset + CH_MIN_DEG[ch];
-  int maxAbs = offset + CH_MAX_DEG[ch];
-  if (targetDeg < minAbs) return minAbs;
-  if (targetDeg > maxAbs) return maxAbs;
-  return targetDeg;
+void startTestMotion(uint8_t ch, int dir, int deg) {
+  globalState.testChannel = ch;
+  globalState.testDir = dir;
+  globalState.testDeg = deg;
+  globalState.currentAction = BUMP_START;
+  globalState.actionTimer = 0;
+  globalState.pidSuspendTest = true;
+}
+
+void updateTestMotion() {
+  if (globalState.currentAction == IDLE) return;
+  unsigned long now = millis();
+  int ch = globalState.testChannel;
+  if (ch < 0 || ch >= 10) {
+    globalState.currentAction = IDLE;
+    globalState.pidSuspendTest = false;
+    return;
+  }
+
+  switch (globalState.currentAction) {
+    case BUMP_START:
+      servos.setServoDeg((uint8_t)ch, globalState.testDir, globalState.testDeg);
+      globalState.actionTimer = now;
+      globalState.currentAction = BUMP_WAIT;
+      break;
+
+    case BUMP_WAIT:
+      if (now - globalState.actionTimer >= 1200) {
+        globalState.currentAction = BUMP_RETURN;
+      }
+      break;
+
+    case BUMP_RETURN:
+      servos.setServoDeg((uint8_t)ch, 1, 0);
+      globalState.actionTimer = now;
+      globalState.currentAction = BUMP_FINISH;
+      break;
+
+    case BUMP_FINISH:
+      if (now - globalState.actionTimer >= 800) {
+        globalState.currentAction = IDLE;
+        globalState.pidSuspendTest = false;
+      }
+      break;
+
+    default:
+      break;
+  }
 }
 
 // ===== PID state =====
@@ -843,15 +385,8 @@ void resetPidState() {
   pidPitchPrevErr = 0.0f;
 }
 
-void setServoDeg(uint8_t ch, int dir, float deg) {
-  int offset = getOffsetDegForChannel(ch);
-  int target = (int)roundf(offset + (dir * deg));
-  target = clampTargetDeg(ch, target);
-  pwm.writeMicroseconds(ch, degToUs(target));
-}
-
 void applyBalancePid(float dt) {
-  if (!PID_ACTIVE || PID_SUSPEND || ESTOP_ACTIVE) return;
+  if (!globalState.pidActive || globalState.pidSuspendTest || globalState.pidSuspendCal || globalState.estopActive) return;
   if (dt <= 0.0f) return;
 
   float errRoll = 0.0f - IMU_ROLL;
@@ -881,16 +416,16 @@ void applyBalancePid(float dt) {
   outPitch *= PID_PITCH_SIGN;
 
   // Roll: left/right opposite
-  setServoDeg(L_ANKLE_ROLL, DIR_L_ANKLE_ROLL, outRoll * PID_ANKLE_GAIN);
-  setServoDeg(R_ANKLE_ROLL, DIR_R_ANKLE_ROLL, -outRoll * PID_ANKLE_GAIN);
-  setServoDeg(L_HIP_ROLL, DIR_L_HIP_ROLL, outRoll * PID_HIP_GAIN);
-  setServoDeg(R_HIP_ROLL, DIR_R_HIP_ROLL, -outRoll * PID_HIP_GAIN);
+  servos.setServoDeg(L_ANKLE_ROLL, DIR_L_ANKLE_ROLL, outRoll * PID_ANKLE_GAIN);
+  servos.setServoDeg(R_ANKLE_ROLL, DIR_R_ANKLE_ROLL, -outRoll * PID_ANKLE_GAIN);
+  servos.setServoDeg(L_HIP_ROLL, DIR_L_HIP_ROLL, outRoll * PID_HIP_GAIN);
+  servos.setServoDeg(R_HIP_ROLL, DIR_R_HIP_ROLL, -outRoll * PID_HIP_GAIN);
 
   // Pitch: left/right same direction
-  setServoDeg(L_ANKLE_PITCH, DIR_L_ANKLE_PITCH, outPitch * PID_ANKLE_GAIN);
-  setServoDeg(R_ANKLE_PITCH, DIR_R_ANKLE_PITCH, outPitch * PID_ANKLE_GAIN);
-  setServoDeg(L_HIP_PITCH, DIR_L_HIP_PITCH, outPitch * PID_HIP_GAIN);
-  setServoDeg(R_HIP_PITCH, DIR_R_HIP_PITCH, outPitch * PID_HIP_GAIN);
+  servos.setServoDeg(L_ANKLE_PITCH, DIR_L_ANKLE_PITCH, outPitch * PID_ANKLE_GAIN);
+  servos.setServoDeg(R_ANKLE_PITCH, DIR_R_ANKLE_PITCH, outPitch * PID_ANKLE_GAIN);
+  servos.setServoDeg(L_HIP_PITCH, DIR_L_HIP_PITCH, outPitch * PID_HIP_GAIN);
+  servos.setServoDeg(R_HIP_PITCH, DIR_R_HIP_PITCH, outPitch * PID_HIP_GAIN);
 }
 
 void delayWithWeb(unsigned long ms) {
@@ -898,54 +433,61 @@ void delayWithWeb(unsigned long ms) {
 }
 
 void applyEmergencyStop(bool active) {
-  ESTOP_ACTIVE = active;
+  portENTER_CRITICAL(&dataMux);
+  globalState.estopActive = active;
+  portEXIT_CRITICAL(&dataMux);
   if (active) {
     resetPidState();
   }
   if (active) {
-    pwm.writeMicroseconds(L_ANKLE_ROLL, centerUsForChannel(L_ANKLE_ROLL));
-    pwm.writeMicroseconds(L_ANKLE_PITCH, centerUsForChannel(L_ANKLE_PITCH));
-    pwm.writeMicroseconds(L_KNEE_PITCH, centerUsForChannel(L_KNEE_PITCH));
-    pwm.writeMicroseconds(L_HIP_PITCH, centerUsForChannel(L_HIP_PITCH));
-    pwm.writeMicroseconds(L_HIP_ROLL, centerUsForChannel(L_HIP_ROLL));
-    pwm.writeMicroseconds(R_ANKLE_ROLL, centerUsForChannel(R_ANKLE_ROLL));
-    pwm.writeMicroseconds(R_ANKLE_PITCH, centerUsForChannel(R_ANKLE_PITCH));
-    pwm.writeMicroseconds(R_KNEE_PITCH, centerUsForChannel(R_KNEE_PITCH));
-    pwm.writeMicroseconds(R_HIP_PITCH, centerUsForChannel(R_HIP_PITCH));
-    pwm.writeMicroseconds(R_HIP_ROLL, centerUsForChannel(R_HIP_ROLL));
+    servos.setCenter(L_ANKLE_ROLL);
+    servos.setCenter(L_ANKLE_PITCH);
+    servos.setCenter(L_KNEE_PITCH);
+    servos.setCenter(L_HIP_PITCH);
+    servos.setCenter(L_HIP_ROLL);
+    servos.setCenter(R_ANKLE_ROLL);
+    servos.setCenter(R_ANKLE_PITCH);
+    servos.setCenter(R_KNEE_PITCH);
+    servos.setCenter(R_HIP_PITCH);
+    servos.setCenter(R_HIP_ROLL);
   }
 }
 
 void bump(uint8_t ch, int dir, int deg) {
-  if (ESTOP_ACTIVE) return;
-  PID_SUSPEND = true;
-  int offset = getOffsetDegForChannel(ch);
-  int target = offset + (dir * deg);
-  target = clampTargetDeg(ch, target);
-  pwm.writeMicroseconds(ch, degToUs(target));
-  delayWithWeb(1200);
-  pwm.writeMicroseconds(ch, centerUsForChannel(ch));
-  delayWithWeb(800);
-  PID_SUSPEND = false;
+  if (globalState.estopActive) return;
+  startTestMotion(ch, dir, deg);
 }
 
 void setup() {
   Serial.begin(115200);
-  Wire.begin(21, 22);
-  pwm.begin();
-  pwm.setPWMFreq(SERVO_FREQ);
+  I2CManager::begin();
+  servos.begin();
   delay(300);
 
   setupImu();
   loadOffsets();
+  loadDirs();
 
-  setupWifiAndWeb();
+  web.begin();
 
   Serial.println("=== Direction Check : Legs + HIP_ROLL ===");
 }
 
 void loop() {
   updateImu();
+  if (globalState.imuCalibrateRequested) {
+    globalState.imuCalibrateRequested = false;
+    applyEmergencyStop(true);
+    globalState.pidSuspendCal = true;
+    resetPidState();
+    calibrateGyroBias();
+    lastImuMicros = micros();
+    IMU_UPDATED = false;
+    IMU_VALID = false;
+    lastImuMs = millis();
+    globalState.pidSuspendCal = false;
+  }
+  updateTestMotion();
   if (millis() - lastImuMs > IMU_STALE_MS) {
     applyEmergencyStop(true);
   }
@@ -956,6 +498,10 @@ void loop() {
     } else {
       applyEmergencyStop(true);
     }
+  }
+  if (globalState.pendingRestart) {
+    globalState.pendingRestart = false;
+    ESP.restart();
   }
   delay(1);
 }
