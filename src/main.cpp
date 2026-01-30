@@ -27,6 +27,10 @@ ServoHandler servos;
 WebHandler web;
 SemaphoreHandle_t I2CManager::mutex = nullptr;
 
+// ===== Mixer Output =====
+float pidOutput[DIR_COUNT] = {0};
+float testOutput[DIR_COUNT] = {0};
+
 // ===== IMU =====
 volatile float IMU_ROLL = 0.0f;
 volatile float IMU_PITCH = 0.0f;
@@ -328,7 +332,6 @@ void startTestMotion(uint8_t ch, int dir, int deg) {
   globalState.testDeg = deg;
   globalState.currentAction = BUMP_START;
   globalState.actionTimer = 0;
-  globalState.pidSuspendTest = true;
 }
 
 void updateTestMotion() {
@@ -337,13 +340,12 @@ void updateTestMotion() {
   int ch = globalState.testChannel;
   if (ch < 0 || ch >= 10) {
     globalState.currentAction = IDLE;
-    globalState.pidSuspendTest = false;
     return;
   }
 
   switch (globalState.currentAction) {
     case BUMP_START:
-      servos.setServoDeg((uint8_t)ch, globalState.testDir, globalState.testDeg);
+      testOutput[ch] = globalState.testDir * globalState.testDeg;
       globalState.actionTimer = now;
       globalState.currentAction = BUMP_WAIT;
       break;
@@ -355,7 +357,7 @@ void updateTestMotion() {
       break;
 
     case BUMP_RETURN:
-      servos.setServoDeg((uint8_t)ch, 1, 0);
+      testOutput[ch] = 0;
       globalState.actionTimer = now;
       globalState.currentAction = BUMP_FINISH;
       break;
@@ -363,14 +365,13 @@ void updateTestMotion() {
     case BUMP_FINISH:
       if (now - globalState.actionTimer >= 800) {
         globalState.currentAction = IDLE;
-        globalState.pidSuspendTest = false;
       }
       break;
 
     default:
       break;
   }
-}
+}    
 
 // ===== PID state =====
 float pidRollI = 0.0f;
@@ -386,7 +387,7 @@ void resetPidState() {
 }
 
 void applyBalancePid(float dt) {
-  if (!globalState.pidActive || globalState.pidSuspendTest || globalState.pidSuspendCal || globalState.estopActive) return;
+  if (!globalState.pidActive || globalState.pidSuspendCal || globalState.estopActive) return;
   if (dt <= 0.0f) return;
 
   float errRoll = 0.0f - IMU_ROLL;
@@ -416,20 +417,25 @@ void applyBalancePid(float dt) {
   outPitch *= PID_PITCH_SIGN;
 
   // Roll: left/right opposite
-  servos.setServoDeg(L_ANKLE_ROLL, DIR_L_ANKLE_ROLL, outRoll * PID_ANKLE_GAIN);
-  servos.setServoDeg(R_ANKLE_ROLL, DIR_R_ANKLE_ROLL, -outRoll * PID_ANKLE_GAIN);
-  servos.setServoDeg(L_HIP_ROLL, DIR_L_HIP_ROLL, outRoll * PID_HIP_GAIN);
-  servos.setServoDeg(R_HIP_ROLL, DIR_R_HIP_ROLL, -outRoll * PID_HIP_GAIN);
+  pidOutput[L_ANKLE_ROLL] = DIR_L_ANKLE_ROLL * outRoll * PID_ANKLE_GAIN;
+  pidOutput[R_ANKLE_ROLL] = DIR_R_ANKLE_ROLL * -outRoll * PID_ANKLE_GAIN;
+  pidOutput[L_HIP_ROLL]   = DIR_L_HIP_ROLL   * outRoll * PID_HIP_GAIN;
+  pidOutput[R_HIP_ROLL]   = DIR_R_HIP_ROLL   * -outRoll * PID_HIP_GAIN;
 
   // Pitch: left/right same direction
-  servos.setServoDeg(L_ANKLE_PITCH, DIR_L_ANKLE_PITCH, outPitch * PID_ANKLE_GAIN);
-  servos.setServoDeg(R_ANKLE_PITCH, DIR_R_ANKLE_PITCH, outPitch * PID_ANKLE_GAIN);
-  servos.setServoDeg(L_HIP_PITCH, DIR_L_HIP_PITCH, outPitch * PID_HIP_GAIN);
-  servos.setServoDeg(R_HIP_PITCH, DIR_R_HIP_PITCH, outPitch * PID_HIP_GAIN);
+  pidOutput[L_ANKLE_PITCH] = DIR_L_ANKLE_PITCH * outPitch * PID_ANKLE_GAIN;
+  pidOutput[R_ANKLE_PITCH] = DIR_R_ANKLE_PITCH * outPitch * PID_ANKLE_GAIN;
+  pidOutput[L_HIP_PITCH]   = DIR_L_HIP_PITCH   * outPitch * PID_HIP_GAIN;
+  pidOutput[R_HIP_PITCH]   = DIR_R_HIP_PITCH   * outPitch * PID_HIP_GAIN;
 }
 
-void delayWithWeb(unsigned long ms) {
-  delay(ms);
+void applyServos() {
+  if (globalState.estopActive) return;
+  for (int i = 0; i < DIR_COUNT; i++) {
+    float finalDeg = pidOutput[i] + testOutput[i];
+    // Use dir=1 because directions are already calculated in the outputs
+    servos.setServoDeg(i, 1, finalDeg);
+  }
 }
 
 void applyEmergencyStop(bool active) {
@@ -438,9 +444,15 @@ void applyEmergencyStop(bool active) {
   portEXIT_CRITICAL(&dataMux);
   if (active) {
     resetPidState();
+    // Clear outputs
+    for (int i = 0; i < DIR_COUNT; i++) {
+      pidOutput[i] = 0;
+      testOutput[i] = 0;
+    }
   }
   if (active) {
     servos.setCenter(L_ANKLE_ROLL);
+    // ... rest of centers
     servos.setCenter(L_ANKLE_PITCH);
     servos.setCenter(L_KNEE_PITCH);
     servos.setCenter(L_HIP_PITCH);
@@ -499,6 +511,9 @@ void loop() {
       applyEmergencyStop(true);
     }
   }
+  
+  applyServos();
+
   if (globalState.pendingRestart) {
     globalState.pendingRestart = false;
     ESP.restart();
