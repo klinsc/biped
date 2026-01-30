@@ -227,6 +227,28 @@ String buildImuJson() {
   return json;
 }
 
+void loadPids() {
+  prefs.begin("pids", true);
+  PID_ROLL_KP = prefs.getFloat("rkp", PID_ROLL_KP);
+  PID_ROLL_KI = prefs.getFloat("rki", PID_ROLL_KI);
+  PID_ROLL_KD = prefs.getFloat("rkd", PID_ROLL_KD);
+  PID_PITCH_KP = prefs.getFloat("pkp", PID_PITCH_KP);
+  PID_PITCH_KI = prefs.getFloat("pki", PID_PITCH_KI);
+  PID_PITCH_KD = prefs.getFloat("pkd", PID_PITCH_KD);
+  prefs.end();
+}
+
+void savePids() {
+  prefs.begin("pids", false);
+  prefs.putFloat("rkp", PID_ROLL_KP);
+  prefs.putFloat("rki", PID_ROLL_KI);
+  prefs.putFloat("rkd", PID_ROLL_KD);
+  prefs.putFloat("pkp", PID_PITCH_KP);
+  prefs.putFloat("pki", PID_PITCH_KI);
+  prefs.putFloat("pkd", PID_PITCH_KD);
+  prefs.end();
+}
+
 void loadOffsets() {
   prefs.begin("offsets", true);
   for (int i = 0; i < DIR_COUNT; i++) {
@@ -477,13 +499,13 @@ void updatePosture() {
   
   // Left Leg
   postureOutput[L_KNEE_PITCH]  = DIR_L_KNEE_PITCH  * (-sq);
-  postureOutput[L_ANKLE_PITCH] = DIR_L_ANKLE_PITCH * (sq * 0.5f);
-  postureOutput[L_HIP_PITCH]   = DIR_L_HIP_PITCH   * (sq * 0.5f);
+  postureOutput[L_ANKLE_PITCH] = DIR_L_ANKLE_PITCH * (sq * 0.6f);
+  postureOutput[L_HIP_PITCH]   = DIR_L_HIP_PITCH   * (sq * 0.7f);
 
   // Right Leg
   postureOutput[R_KNEE_PITCH]  = DIR_R_KNEE_PITCH  * (-sq);
-  postureOutput[R_ANKLE_PITCH] = DIR_R_ANKLE_PITCH * (sq * 0.5f);
-  postureOutput[R_HIP_PITCH]   = DIR_R_HIP_PITCH   * (sq * 0.5f);
+  postureOutput[R_ANKLE_PITCH] = DIR_R_ANKLE_PITCH * (sq * 0.6f);
+  postureOutput[R_HIP_PITCH]   = DIR_R_HIP_PITCH   * (sq * 0.7f);
 }
 
 void applyServos() {
@@ -542,6 +564,7 @@ void setup() {
   setupImu();
   loadOffsets();
   loadDirs();
+  loadPids();
 
   web.begin();
 

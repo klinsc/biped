@@ -45,6 +45,7 @@ extern String buildImuJson();
 
 extern void saveDir(int idx);
 extern void saveOffset(int idx);
+extern void savePids();
 extern void startTestMotion(uint8_t ch, int dir, int deg);
 extern void applyEmergencyStop(bool active);
 extern void resetPidState();
@@ -633,6 +634,7 @@ void WebHandler::begin() {
     }
     portEXIT_CRITICAL(&dataMux);
     
+    savePids();
     resetPidState();
     request->send(200, "application/json", buildPidJson());
   });

@@ -5,11 +5,11 @@
 // Servo constants
 static const int SERVO_FREQ = 50;
 static const int US_CENTER = 1500;
-static const int US_MIN = 1000;
-static const int US_MAX = 2000;
+static const int US_MIN = 500;   // Widen range to allow full motion
+static const int US_MAX = 2500;  // Widen range to allow full motion
 
 // Soft limits (deg around offset)
-static const int MAX_SOFT_DEG = 50;
+static const int MAX_SOFT_DEG = 70;
 static const int CH_MIN_DEG[10] = {-MAX_SOFT_DEG, -MAX_SOFT_DEG, -MAX_SOFT_DEG, -MAX_SOFT_DEG, -MAX_SOFT_DEG,
                                    -MAX_SOFT_DEG, -MAX_SOFT_DEG, -MAX_SOFT_DEG, -MAX_SOFT_DEG, -MAX_SOFT_DEG};
 static const int CH_MAX_DEG[10] = {MAX_SOFT_DEG, MAX_SOFT_DEG, MAX_SOFT_DEG, MAX_SOFT_DEG, MAX_SOFT_DEG, MAX_SOFT_DEG, MAX_SOFT_DEG, MAX_SOFT_DEG, MAX_SOFT_DEG, MAX_SOFT_DEG};
