@@ -27,10 +27,6 @@ ServoHandler servos;
 WebHandler web;
 SemaphoreHandle_t I2CManager::mutex = nullptr;
 
-// ===== Mixer Output =====
-float pidOutput[DIR_COUNT] = {0};
-float testOutput[DIR_COUNT] = {0};
-
 // ===== IMU =====
 volatile float IMU_ROLL = 0.0f;
 volatile float IMU_PITCH = 0.0f;
@@ -117,6 +113,10 @@ int* DIR_PTRS[DIR_COUNT] = {
 };
 
 int OFFSETS_DEG[DIR_COUNT] = {0};
+
+// ===== Mixer Output =====
+float pidOutput[DIR_COUNT] = {0};
+float testOutput[DIR_COUNT] = {0};
 
 void bump(uint8_t ch, int dir, int deg = 10);
 void applyEmergencyStop(bool active);
