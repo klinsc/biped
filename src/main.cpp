@@ -256,7 +256,10 @@ void calibrateGyroBias() {
   float sumX = 0.0f, sumY = 0.0f, sumZ = 0.0f;
   sensors_event_t a, g, temp;
   for (int i = 0; i < samples; i++) {
-    mpu.getEvent(&a, &g, &temp);
+    {
+      I2CManager::Lock lock;
+      mpu.getEvent(&a, &g, &temp);
+    }
     sumX += g.gyro.x;
     sumY += g.gyro.y;
     sumZ += g.gyro.z;
@@ -292,7 +295,10 @@ void updateImu() {
   lastImuMicros = now;
 
   sensors_event_t a, g, temp;
-  mpu.getEvent(&a, &g, &temp);
+  {
+      I2CManager::Lock lock;
+      mpu.getEvent(&a, &g, &temp);
+  }
 
   float axf = a.acceleration.x;
   float ayf = a.acceleration.y;
@@ -402,6 +408,14 @@ void applyBalancePid(float dt) {
 
   if (dt <= 0.0f) return;
 
+  // Snapshot PID params safely
+  float Kp, Ki, Kd;
+  portENTER_CRITICAL(&dataMux);
+  Kp = PID_KP;
+  Ki = PID_KI;
+  Kd = PID_KD;
+  portEXIT_CRITICAL(&dataMux);
+
   float errRoll = 0.0f - IMU_ROLL;
   float errPitch = 0.0f - IMU_PITCH;
 
@@ -417,8 +431,8 @@ void applyBalancePid(float dt) {
   pidRollPrevErr = errRoll;
   pidPitchPrevErr = errPitch;
 
-  float outRoll = (PID_KP * errRoll) + (PID_KI * pidRollI) + (PID_KD * dRoll);
-  float outPitch = (PID_KP * errPitch) + (PID_KI * pidPitchI) + (PID_KD * dPitch);
+  float outRoll = (Kp * errRoll) + (Ki * pidRollI) + (Kd * dRoll);
+  float outPitch = (Kp * errPitch) + (Ki * pidPitchI) + (Kd * dPitch);
 
   if (outRoll > PID_MAX_OUT_DEG) outRoll = PID_MAX_OUT_DEG;
   if (outRoll < -PID_MAX_OUT_DEG) outRoll = -PID_MAX_OUT_DEG;
